@@ -10,7 +10,7 @@ import os
 import re
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # Directories that are calibration/utility and should be skipped
@@ -173,28 +173,15 @@ def scan_directory(root_dir: str):
         rel = Path(dirpath).relative_to(root_path)
         depth = len(rel.parts)
 
-        # Collect object dirs at depth 2
-        if depth == 2:
+        if depth in (2, 3):
             has_fits = any(is_light_file(fn) for fn in filenames)
             if has_fits:
+                # For depth 3, only add if parent is not already an object dir
+                if depth == 3:
+                    parent = str(Path(dirpath).parent)
+                    if parent in object_dirs:
+                        continue
                 object_dirs.add(dirpath)
-
-    # Also check depth 3 dirs that are under depth-2 dirs NOT in object_dirs
-    # (e.g. 6D/15mm/CSSP-2025 where 15mm has no fits but CSSP-2025 does)
-    for dirpath, dirnames, filenames in os.walk(root_path):
-        if dirpath == str(root_path):
-            dirnames[:] = [d for d in dirnames if not is_skip_dir(d)]
-            continue
-        dirnames[:] = [d for d in dirnames if not is_skip_dir(d)]
-        rel = Path(dirpath).relative_to(root_path)
-        depth = len(rel.parts)
-        if depth == 3:
-            # Check if parent is already an object dir
-            parent = str(Path(dirpath).parent)
-            if parent not in [str(od) for od in object_dirs]:
-                has_fits = any(is_light_file(fn) for fn in filenames)
-                if has_fits:
-                    object_dirs.add(dirpath)
 
     # Second pass: process each object directory
     for dirpath in object_dirs:
@@ -505,13 +492,7 @@ function sortTable(col) {
 
 def main():
     root_dir = sys.argv[1] if len(sys.argv) > 1 else '/data/Astro/CCD'
-    output_file = sys.argv[3] if len(sys.argv) > 3 else 'inventory.html'
-    months = 12
-    if len(sys.argv) > 2:
-        try:
-            months = int(sys.argv[2])
-        except ValueError:
-            pass
+    output_file = sys.argv[2] if len(sys.argv) > 2 else 'inventory.html'
 
     if not os.path.isdir(root_dir):
         print(f"Error: Directory not found: {root_dir}")
