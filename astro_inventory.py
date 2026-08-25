@@ -262,8 +262,8 @@ def scan_directory(root_dir: str):
             'final_image_present': final_image_present,
         })
 
-    # Sort by telescope, then object name
-    objects.sort(key=lambda o: (o['telescope'].lower(), o['object_name'].lower()))
+    # Sort by last modified date descending (most recent first)
+    objects.sort(key=lambda o: (o['date_max'] or datetime.min), reverse=True)
     return objects
 
 
@@ -414,7 +414,7 @@ def html_report(objects: list, output_path: str):
   <th data-col="3" onclick="sortTable(3)">Exposures per Filter <span class="sort-arrow">▲</span></th>
   <th data-col="4" onclick="sortTable(4)">Has Project <span class="sort-arrow">▲</span></th>
   <th data-col="5" onclick="sortTable(5)">Has JPG <span class="sort-arrow">▲</span></th>
-  <th data-col="6" onclick="sortTable(6)">Last Modified <span class="sort-arrow">▲</span></th>
+  <th data-col="6" onclick="sortTable(6)">Last Modified <span class="sort-arrow">▼</span></th>
 </tr>
 </thead>
 <tbody>
@@ -441,8 +441,8 @@ def html_report(objects: list, output_path: str):
 </table>
 <script>
 var data = DATA_PLACEHOLDER;
-var currentCol = -1;
-var ascending = true;
+var currentCol = 6;
+var ascending = false;
 
 function sortTable(col) {
     if (currentCol === col) { ascending = !ascending; }
