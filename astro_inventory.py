@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Astronomy image report generator.
+Astronomy image inventory generator.
 
 Traverses /data/Astro/CCD once, builds an in-memory list of all objects
-(telescope -> object), and generates a single report.html with a sortable
+(telescope -> object), and generates a single inventory.html with a sortable
 table of all objects.
 
 Row colors:
@@ -18,7 +18,7 @@ from datetime import datetime
 from collections import defaultdict
 
 ROOT = "/data/Astro/CCD"
-OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.html")
+OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory.html")
 
 FILTERS = {
     "L": "Luminance",
@@ -147,11 +147,20 @@ def traverse(root):
                         "latest": None,
                         "has_project": False,
                         "has_final": False,
+                        "size_bytes": 0,
+                        "final_images": [],
                     }
 
                     # --- recursive walk: fits / cr2 / cr3 at any depth ---
                     master_path = os.path.join(obj_path, "master")
                     for dirpath, dirnames, filenames in os.walk(obj_path):
+                        # recursive size of the whole object directory
+                        for fn in filenames:
+                            try:
+                                rec["size_bytes"] += os.stat(os.path.join(dirpath, fn)).st_size
+                            except OSError:
+                                pass
+
                         # pxiproject: only direct children of the object dir
                         if dirpath == obj_path:
                             for d in dirnames:
@@ -167,6 +176,7 @@ def traverse(root):
                                 lower = fn.lower()
                                 if lower.endswith(".jpg") or lower.endswith(".jpeg"):
                                     rec["has_final"] = True
+                                    rec["final_images"].append(fn)
 
                         for fn in filenames:
                             lower = fn.lower()
@@ -245,6 +255,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   tr.yellow {{ background: #fff3cd !important; }}
   .total {{ font-weight: bold; }}
   .meta {{ color: #666; margin-bottom: 1em; }}
+  .thumbs img {{ max-height: 60px; max-width: 120px; margin: 2px; border: 1px solid #999; vertical-align: middle; }}
 </style>
 </head>
 <body>
@@ -258,9 +269,11 @@ Click a column header to sort (click again to reverse). Default: Latest image, d
   <th data-type="str">Telescope<span class="arrow"></span></th>
   <th data-type="str">Object<span class="arrow"></span></th>
   <th data-type="num">Total exposure<span class="arrow"></span></th>
+  <th data-type="num">Size (MB)<span class="arrow"></span></th>
   <th data-type="str">Filters (count / duration / total)<span class="arrow"></span></th>
   <th data-type="bool">Project<span class="arrow"></span></th>
   <th data-type="bool">Final image<span class="arrow"></span></th>
+  <th data-type="str">Master images<span class="arrow"></span></th>
   <th data-type="str">Plan<span class="arrow"></span></th>
 </tr>
 </thead>
@@ -351,15 +364,28 @@ def build_rows(records):
         p_sort, p_disp = yn(rec["has_project"])
         f_sort, f_disp = yn(rec["has_final"])
 
+        size_mb = rec["size_bytes"] / (1024 * 1024)
+
+        thumbs = []
+        for fn in rec["final_images"]:
+            url = "file://" + os.path.join(rec["path"], "master", fn)
+            thumbs.append(
+                f'<a href="{html.escape(url)}">'
+                f'<img src="{html.escape(url)}" alt="{html.escape(fn)}"></a>'
+            )
+        thumbs_html = ('<span class="thumbs">' + " ".join(thumbs) + "</span>") if thumbs else "—"
+
         rows.append(
             f'<tr class="{cls}">'
             f'<td data-sort="{ts_sort}">{html.escape(ts_disp)}</td>'
             f'<td data-sort="{html.escape(rec["telescope"])}">{html.escape(rec["telescope"])}</td>'
             f'<td data-sort="{html.escape(rec["object"])}">{html.escape(rec["object"])}</td>'
             f'<td data-sort="{total_sec}">{fmt_total(total_sec)}</td>'
+            f'<td data-sort="{size_mb:.6f}">{size_mb:.1f}</td>'
             f'<td data-sort="">{filters_html}</td>'
             f'<td data-sort="{p_sort}">{p_disp}</td>'
             f'<td data-sort="{f_sort}">{f_disp}</td>'
+            f'<td data-sort="">{thumbs_html}</td>'
             f'<td data-sort="">{html.escape(rec["plan"]) if rec["plan"] else "—"}</td>'
             f"</tr>"
         )
