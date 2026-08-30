@@ -14,16 +14,24 @@ Run:
 import os
 import re
 import html
+import shutil
 import threading
 from datetime import datetime
 from urllib.parse import quote, urlencode
 
-from flask import Flask, request, redirect, url_for, flash, get_flashed_messages, send_file
+from flask import Flask, request, redirect, url_for, flash, get_flashed_messages, send_file, render_template_string
 
 from astro_inventory import ROOT, traverse, build_rows  # noqa: F401
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
+
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 PAGE_SIZE = 20
 
@@ -62,6 +70,7 @@ COLUMNS = [
     ("final",   "Final image",           True,  lambda r: 1 if r["has_final"] else 0, "asc"),
     ("masters", "Master images",         False, None, None),
     ("plan",    "Plan",                  False, None, None),
+    ("actions", "Actions",               False, None, None),
 ]
 COL_BY_KEY = {c[0]: c for c in COLUMNS}
 
@@ -119,6 +128,81 @@ def image(relpath):
     if not os.path.isfile(full):
         return "Not found", 404
     return send_file(full)
+
+
+def _resolve_object(telescope, name):
+    """Validate telescope/object names and return the object dir path,
+    or (None, error_message)."""
+    if re.search(r"[\x00/\\]", telescope) or telescope in ("", ".", ".."):
+        return None, "Invalid telescope name."
+    if re.search(r"[\x00/\\]", name) or name in ("", ".", ".."):
+        return None, "Invalid object name."
+    tel_dir = os.path.join(ROOT, telescope)
+    obj_dir = os.path.join(tel_dir, name)
+    if not os.path.isdir(tel_dir):
+        return None, f"Telescope directory not found: {telescope}"
+    if not os.path.isdir(obj_dir):
+        return None, f"Object directory not found: {telescope}/{name}"
+    # make sure the resolved path stays under ROOT
+    if not os.path.realpath(obj_dir).startswith(os.path.realpath(ROOT) + os.sep):
+        return None, "Invalid path."
+    return obj_dir, None
+
+
+@app.route("/edit/<telescope>/<name>", methods=["GET", "POST"])
+def edit_plan(telescope, name):
+    obj_dir, err = _resolve_object(telescope, name)
+    if err:
+        flash(err, "error")
+        return redirect(url_for("index"))
+    plan_path = os.path.join(obj_dir, "plan.md")
+
+    if request.method == "POST":
+        content = request.form.get("plan", "")
+        try:
+            with open(plan_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            flash(f"Failed to save plan: {e}", "error")
+            return redirect(url_for("index"))
+        flash(f"Saved {telescope}/{name}/plan.md", "ok")
+        get_records(force=True)
+        return redirect(url_for("index"))
+
+    try:
+        with open(plan_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except (OSError, UnicodeDecodeError):
+        content = ""
+
+    body = f"""
+<h1>Edit plan: {html.escape(telescope)}/{html.escape(name)}</h1>
+<p class="meta">{html.escape(plan_path)}</p>
+<form method="post" action="{url_for('edit_plan', telescope=telescope, name=name)}">
+  <textarea name="plan" rows="24" cols="100" spellcheck="false">{html.escape(content)}</textarea>
+  <p>
+    <button type="submit">Save</button>
+    <a href="{url_for('index')}" class="cancel">Cancel</a>
+  </p>
+</form>
+"""
+    return PAGE_SHELL + body
+
+
+@app.route("/delete/<telescope>/<name>", methods=["POST"])
+def delete_object(telescope, name):
+    obj_dir, err = _resolve_object(telescope, name)
+    if err:
+        flash(err, "error")
+        return redirect(url_for("index"))
+    try:
+        shutil.rmtree(obj_dir)
+    except OSError as e:
+        flash(f"Failed to delete {obj_dir}: {e}", "error")
+        return redirect(url_for("index"))
+    flash(f"Deleted {telescope}/{name}", "ok")
+    get_records(force=True)
+    return redirect(url_for("index"))
 
 
 @app.route("/add", methods=["POST"])
@@ -209,6 +293,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .pager a:hover {{ background: #e8edf5; }}
   .pager span.cur {{ background: #2b3a55; color: #fff; border-color: #2b3a55; }}
   .pager span.disabled {{ color: #aaa; border-color: #eee; }}
+  .sep {{ color: #999; }}
+  a.del {{ color: #b00020; }}
+  textarea.plan {{ font-family: monospace; width: 100%; box-sizing: border-box; }}
+  a.cancel {{ text-decoration: none; color: #2b3a55; }}
+  button.danger {{ background: #b00020; color: #fff; border: none; padding: 6px 16px; cursor: pointer; }}
 </style>
 </head>
 <body>
@@ -260,6 +349,28 @@ Click a column header to sort. <a href="{refresh_url}">Refresh scan</a></p>
 """
 
 
+# minimal page shell for the edit/delete pages (same styles as the report)
+PAGE_SHELL = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Astro Capture Report</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 2em; }
+  .flash { margin: 0.6em 0; padding: 0.5em 0.8em; border-radius: 4px; }
+  .flash.ok { background: #d4edda; color: #155724; }
+  .flash.error { background: #f8d7da; color: #721c24; }
+  .sep { color: #999; }
+  a.del { color: #b00020; }
+  textarea.plan { font-family: monospace; width: 100%; box-sizing: border-box; }
+  a.cancel { text-decoration: none; color: #2b3a55; }
+  button.danger { background: #b00020; color: #fff; border: none; padding: 6px 16px; cursor: pointer; }
+</style>
+</head>
+<body>
+"""
+
+
 def _pager_url(page, sort_key, direction):
     params = {"sort": sort_key, "dir": direction, "page": page}
     return "?" + urlencode(params)
@@ -306,6 +417,12 @@ def render_page(page_records, generated, telescopes, total, page, pages, sort_ke
         # path is under ROOT: /data/Astro/CCD/<telescope>/<object>/master/<file>
         return f"/img/{quote(os.path.relpath(path, ROOT))}"
 
+    def actions_url(tel, name):
+        return (
+            url_for("edit_plan", telescope=tel, name=name),
+            url_for("delete_object", telescope=tel, name=name),
+        )
+
     # --- sortable header cells ---
     header_cells = []
     for key, name, sortable, _fn, _def_dir in COLUMNS:
@@ -336,7 +453,7 @@ def render_page(page_records, generated, telescopes, total, page, pages, sort_ke
         flashes=flashes,
         refresh_url=_pager_url(1, sort_key, direction) + "&refresh=1",
         header_cells="\n".join(header_cells),
-        rows=build_rows(page_records, image_url=image_url),
+        rows=build_rows(page_records, image_url=image_url, actions_url=actions_url),
         pager=pager,
     )
 

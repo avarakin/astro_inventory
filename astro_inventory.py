@@ -275,6 +275,7 @@ Click a column header to sort (click again to reverse). Default: Latest image, d
   <th data-type="bool">Final image<span class="arrow"></span></th>
   <th data-type="str">Master images<span class="arrow"></span></th>
   <th data-type="str">Plan<span class="arrow"></span></th>
+  <th data-type="str">Actions<span class="arrow"></span></th>
 </tr>
 </thead>
 <tbody>
@@ -325,12 +326,13 @@ sortTable(0, -1);
 """
 
 
-def build_rows(records, image_url=None):
-    """image_url: callable(path) -> url for final images; default is file://"""
+def build_rows(records, image_url=None, actions_url=None):
+    """image_url: callable(path) -> url for final images; default is file://
+    actions_url: callable(telescope, object) -> (edit_url, delete_url) or None"""
     if image_url is None:
         image_url = lambda p: "file://" + p
     rows = []
-    for rec in records:
+    for idx, rec in enumerate(records):
         total_sec = 0.0
         for flt, d in rec["filters"].items():
             total_sec += d["seconds"]
@@ -384,6 +386,20 @@ def build_rows(records, image_url=None):
             )
         thumbs_html = ('<span class="thumbs">' + " ".join(thumbs) + "</span>") if thumbs else "—"
 
+        if actions_url is None:
+            actions_html = "—"
+        else:
+            edit_url, delete_url = actions_url(rec["telescope"], rec["object"])
+            obj_label = html.escape(rec["telescope"] + "/" + rec["object"])
+            actions_html = (
+                f'<a href="{html.escape(edit_url)}">Edit plan</a>'
+                f' <span class="sep">|</span> '
+                f'<a class="del" href="{html.escape(delete_url)}" '
+                f'onclick="event.preventDefault();if(confirm(\'Delete {obj_label} and all its files? This cannot be undone.\'))document.getElementById(\'del_{idx}\').submit();return false">'
+                f'Delete directory</a>'
+                f'<form id="del_{idx}" method="post" action="{html.escape(delete_url)}" style="display:none"><input type="hidden" name="confirm" value="yes"></form>'
+            )
+
         rows.append(
             f'<tr class="{cls}">'
             f'<td data-sort="{ts_sort}">{html.escape(ts_disp)}</td>'
@@ -396,6 +412,7 @@ def build_rows(records, image_url=None):
             f'<td data-sort="{f_sort}">{f_disp}</td>'
             f'<td data-sort="">{thumbs_html}</td>'
             f'<td data-sort="">{plan_html}</td>'
+            f'<td data-sort="">{actions_html}</td>'
             f"</tr>"
         )
     return "\n".join(rows)
