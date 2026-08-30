@@ -325,7 +325,10 @@ sortTable(0, -1);
 """
 
 
-def build_rows(records):
+def build_rows(records, image_url=None):
+    """image_url: callable(path) -> url for final images; default is file://"""
+    if image_url is None:
+        image_url = lambda p: "file://" + p
     rows = []
     for rec in records:
         total_sec = 0.0
@@ -374,9 +377,9 @@ def build_rows(records):
 
         thumbs = []
         for fn in rec["final_images"]:
-            url = "file://" + os.path.join(rec["path"], "master", fn)
+            url = image_url(os.path.join(rec["path"], "master", fn))
             thumbs.append(
-                f'<a href="{html.escape(url)}">'
+                f'<a href="{html.escape(url)}" target="_blank">'
                 f'<img src="{html.escape(url)}" alt="{html.escape(fn)}"></a>'
             )
         thumbs_html = ('<span class="thumbs">' + " ".join(thumbs) + "</span>") if thumbs else "—"
@@ -409,7 +412,7 @@ def main():
         gen=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         rows=build_rows(records),
     )
-    with open(OUTPUT, "w") as f:
+    with open(OUTPUT, "w", encoding="utf-8") as f:
         f.write(html_text)
     print(f"Report written to {OUTPUT}")
 

@@ -1,4 +1,5 @@
 inventory.html
 commands.log
+.venv/
 __pycache__/
 *.pyc
