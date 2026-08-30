@@ -2,8 +2,9 @@
 """
 Astronomy image inventory — Flask server.
 
-Serves the same report as astro_inventory.py, plus an "Add a new object"
-section that creates /data/Astro/CCD/<telescope>/<object>/plan.md.
+Serves the report with server-side sorting and pagination (20 rows/page),
+plus an "Add a new object" section that creates
+/data/Astro/CCD/<telescope>/<object>/plan.md.
 
 Run:
     .venv/bin/python astro_inventory_server.py
@@ -15,14 +16,16 @@ import re
 import html
 import threading
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
-from flask import Flask, request, redirect, url_for, flash
+from flask import Flask, request, redirect, url_for, flash, get_flashed_messages, send_file
 
-from astro_inventory import ROOT, traverse, build_rows, HTML_TEMPLATE, fmt_total  # noqa: F401
+from astro_inventory import ROOT, traverse, build_rows  # noqa: F401
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
+
+PAGE_SIZE = 20
 
 # --- scan cache --------------------------------------------------------------
 
@@ -39,6 +42,42 @@ def get_records(force=False):
     return _cache["records"], _cache["generated"]
 
 
+# --- sorting -----------------------------------------------------------------
+
+def _total_seconds(rec):
+    total = sum(d["seconds"] for d in rec["filters"].values())
+    total += rec["cr2cr3_count"] * 30
+    return total
+
+
+# key -> (display name, sortable, sort_value_fn, default_dir)
+COLUMNS = [
+    ("latest",  "Latest image",          True,  lambda r: (r["latest"].timestamp() if r["latest"] else 0), "desc"),
+    ("telescope", "Telescope",           True,  lambda r: r["telescope"], "asc"),
+    ("object",  "Object",                True,  lambda r: r["object"], "asc"),
+    ("total",   "Total exposure",        True,  _total_seconds, "desc"),
+    ("size",    "Size (MB)",             True,  lambda r: rec_size_mb(r), "desc"),
+    ("filters", "Filters (count / duration / total)", False, None, None),
+    ("project", "Project",               True,  lambda r: 1 if r["has_project"] else 0, "asc"),
+    ("final",   "Final image",           True,  lambda r: 1 if r["has_final"] else 0, "asc"),
+    ("masters", "Master images",         False, None, None),
+    ("plan",    "Plan",                  False, None, None),
+]
+COL_BY_KEY = {c[0]: c for c in COLUMNS}
+
+
+def rec_size_mb(rec):
+    return rec["size_bytes"] / (1024 * 1024)
+
+
+def sort_records(records, key, direction):
+    if key not in COL_BY_KEY or not COL_BY_KEY[key][1]:
+        key = "latest"
+    fn = COL_BY_KEY[key][3]
+    reverse = direction == "desc"
+    return sorted(records, key=fn, reverse=reverse)
+
+
 # --- routes ------------------------------------------------------------------
 
 @app.route("/")
@@ -46,7 +85,29 @@ def index():
     force = request.args.get("refresh") == "1"
     records, generated = get_records(force=force)
     telescopes = sorted({r["telescope"] for r in records})
-    return render_page(records, generated, telescopes)
+
+    # --- sort ---
+    sort_key = request.args.get("sort", "latest")
+    if sort_key not in COL_BY_KEY or not COL_BY_KEY[sort_key][1]:
+        sort_key = "latest"
+    direction = request.args.get("dir", COL_BY_KEY[sort_key][4])
+    if direction not in ("asc", "desc"):
+        direction = "asc"
+    records = sort_records(records, sort_key, direction)
+
+    # --- pagination ---
+    total = len(records)
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = request.args.get("page", type=int) or 1
+    page = max(1, min(page, pages))
+    start = (page - 1) * PAGE_SIZE
+    page_records = records[start:start + PAGE_SIZE]
+
+    return render_page(
+        page_records, generated, telescopes,
+        total=total, page=page, pages=pages,
+        sort_key=sort_key, direction=direction,
+    )
 
 
 @app.route("/img/<path:relpath>")
@@ -57,7 +118,6 @@ def image(relpath):
         return "Not found", 404
     if not os.path.isfile(full):
         return "Not found", 404
-    from flask import send_file
     return send_file(full)
 
 
@@ -65,6 +125,11 @@ def image(relpath):
 def add_object():
     telescope = (request.form.get("telescope") or "").strip()
     name = (request.form.get("object") or "").strip()
+    constellation = (request.form.get("constellation") or "").strip()
+    ra = (request.form.get("ra") or "").strip()
+    dec = (request.form.get("dec") or "").strip()
+    rotation = (request.form.get("rotation") or "").strip()
+    sample = (request.form.get("sample") or "").strip()
 
     if not telescope or not name:
         flash("Please choose a telescope and enter an object name.", "error")
@@ -90,6 +155,18 @@ def add_object():
         os.makedirs(obj_dir)
         with open(plan_path, "w", encoding="utf-8") as f:
             f.write(f"# {name}\n\n")
+            if constellation:
+                f.write(f"- **Constellation:** {constellation}\n")
+            if ra:
+                f.write(f"- **RA:** {ra}\n")
+            if dec:
+                f.write(f"- **DEC:** {dec}\n")
+            if rotation:
+                f.write(f"- **Rotation:** {rotation}\n")
+            if sample:
+                f.write(f"- **Sample:** {sample}\n")
+            if constellation or ra or dec or rotation or sample:
+                f.write("\n")
     except OSError as e:
         flash(f"Failed to create {obj_dir}: {e}", "error")
         return redirect(url_for("index"))
@@ -110,8 +187,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 2em; }}
   table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
   th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; }}
-  th {{ background: #2b3a55; color: #fff; cursor: pointer; position: sticky; top: 0; user-select: none; }}
-  th:hover {{ background: #3d5177; }}
+  th {{ background: #2b3a55; color: #fff; position: sticky; top: 0; user-select: none; }}
+  th a {{ color: #fff; text-decoration: none; }}
   th .arrow {{ display: inline-block; width: 14px; font-size: 11px; opacity: 0.6; }}
   tr:nth-child(even) {{ background: #f4f6fa; }}
   tr.red {{ background: #f8d7da !important; }}
@@ -127,13 +204,17 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .flash {{ margin: 0.6em 0 0; padding: 0.5em 0.8em; border-radius: 4px; }}
   .flash.ok {{ background: #d4edda; color: #155724; }}
   .flash.error {{ background: #f8d7da; color: #721c24; }}
+  .pager {{ margin: 0.8em 0; font-size: 14px; }}
+  .pager a, .pager span.cur {{ padding: 3px 9px; margin: 0 2px; border: 1px solid #ccc; border-radius: 4px; text-decoration: none; color: #2b3a55; }}
+  .pager a:hover {{ background: #e8edf5; }}
+  .pager span.cur {{ background: #2b3a55; color: #fff; border-color: #2b3a55; }}
+  .pager span.disabled {{ color: #aaa; border-color: #eee; }}
 </style>
 </head>
 <body>
 <h1>Astronomy Capture Report</h1>
 <p class="meta">Root: {root} &middot; Objects: {n} &middot; Generated: {gen}<br>
-Click a column header to sort (click again to reverse). Default: Latest image, descending.
-<a href="?refresh=1">Refresh scan</a></p>
+Click a column header to sort. <a href="{refresh_url}">Refresh scan</a></p>
 
 <div class="addbox">
   <h2>Add a new object:</h2>
@@ -145,76 +226,74 @@ Click a column header to sort (click again to reverse). Default: Latest image, d
     </select>
     <label for="object">Object Name:</label>
     <input type="text" name="object" id="object" placeholder="e.g. M31" required>
+    <label for="constellation">Constellation:</label>
+    <input type="text" name="constellation" id="constellation" placeholder="e.g. Andromeda">
+    <label for="ra">RA:</label>
+    <input type="text" name="ra" id="ra" placeholder="e.g. 00h42m44s">
+    <label for="dec">DEC:</label>
+    <input type="text" name="dec" id="dec" placeholder="e.g. +41°16′09″">
+    <label for="rotation">Rotation:</label>
+    <input type="number" name="rotation" id="rotation" placeholder="e.g. 45" step="any">
+    <label for="sample">Sample:</label>
+    <input type="text" name="sample" id="sample" placeholder="e.g. 2x2 binning">
     <button type="submit">Add</button>
   </form>
   {flashes}
 </div>
 
+<p class="pager">{pager}</p>
+
 <table id="report">
 <thead>
 <tr>
-  <th data-type="ts">Latest image<span class="arrow"></span></th>
-  <th data-type="str">Telescope<span class="arrow"></span></th>
-  <th data-type="str">Object<span class="arrow"></span></th>
-  <th data-type="num">Total exposure<span class="arrow"></span></th>
-  <th data-type="num">Size (MB)<span class="arrow"></span></th>
-  <th data-type="str">Filters (count / duration / total)<span class="arrow"></span></th>
-  <th data-type="bool">Project<span class="arrow"></span></th>
-  <th data-type="bool">Final image<span class="arrow"></span></th>
-  <th data-type="str">Master images<span class="arrow"></span></th>
-  <th data-type="str">Plan<span class="arrow"></span></th>
+{header_cells}
 </tr>
 </thead>
 <tbody>
 {rows}
 </tbody>
 </table>
-<script>
-const table = document.getElementById('report');
-const tbody = table.tBodies[0];
-const headers = table.tHead.rows[0].cells;
 
-function sortTable(colIdx, dir) {{
-  const type = headers[colIdx].dataset.type;
-  const rows = Array.from(tbody.rows);
-  rows.sort((a, b) => {{
-    let va = a.cells[colIdx].dataset.sort, vb = b.cells[colIdx].dataset.sort;
-    if (type === 'num' || type === 'ts') {{
-      va = parseFloat(va) || 0; vb = parseFloat(vb) || 0;
-      return dir * (va - vb);
-    }}
-    if (type === 'bool') {{
-      va = va === '1' ? 1 : 0; vb = vb === '1' ? 1 : 0;
-      return dir * (va - vb);
-    }}
-    return dir * va.localeCompare(vb);
-  }});
-  rows.forEach(r => tbody.appendChild(r));
-  for (let i = 0; i < headers.length; i++) {{
-    headers[i].removeAttribute('data-sorted');
-    headers[i].querySelector('.arrow').textContent = '\\u2195';
-  }}
-  headers[colIdx].dataset.sorted = dir > 0 ? 'asc' : 'desc';
-  headers[colIdx].querySelector('.arrow').textContent = dir > 0 ? '\\u2191' : '\\u2193';
-}}
-
-for (let i = 0; i < headers.length; i++) {{
-  headers[i].addEventListener('click', () => {{
-    const cur = headers[i].dataset.sorted;
-    const dir = (i === 0 && !cur) ? -1 : (cur === 'asc' ? -1 : 1);
-    sortTable(i, dir);
-  }});
-}}
-sortTable(0, -1);
-</script>
+<p class="pager">{pager}</p>
 </body>
 </html>
 """
 
 
-def render_page(records, generated, telescopes):
-    from flask import get_flashed_messages
+def _pager_url(page, sort_key, direction):
+    params = {"sort": sort_key, "dir": direction, "page": page}
+    return "?" + urlencode(params)
 
+
+def render_pager(page, pages, total, sort_key, direction):
+    parts = []
+    if page > 1:
+        parts.append(f'<a href="{_pager_url(page - 1, sort_key, direction)}">&laquo; Prev</a>')
+    else:
+        parts.append('<span class="disabled">&laquo; Prev</span>')
+
+    # page numbers: 1 … around current … last
+    nums = {1, pages, page - 1, page, page + 1}
+    nums = sorted(n for n in nums if 1 <= n <= pages)
+    prev = 0
+    for n in nums:
+        if n - prev > 1:
+            parts.append("…")
+        if n == page:
+            parts.append(f'<span class="cur">{n}</span>')
+        else:
+            parts.append(f'<a href="{_pager_url(n, sort_key, direction)}">{n}</a>')
+        prev = n
+
+    if page < pages:
+        parts.append(f'<a href="{_pager_url(page + 1, sort_key, direction)}">Next &raquo;</a>')
+    else:
+        parts.append('<span class="disabled">Next &raquo;</span>')
+    parts.append(f"<span>Page {page} of {pages} &mdash; {total} objects</span>")
+    return " ".join(parts)
+
+
+def render_page(page_records, generated, telescopes, total, page, pages, sort_key, direction):
     options = "\n".join(
         f'<option value="{html.escape(t)}">{html.escape(t)}</option>' for t in telescopes
     )
@@ -222,18 +301,43 @@ def render_page(records, generated, telescopes):
         f'<div class="flash {html.escape(cat)}">{html.escape(msg)}</div>'
         for cat, msg in get_flashed_messages(with_categories=True)
     )
+
     def image_url(path):
         # path is under ROOT: /data/Astro/CCD/<telescope>/<object>/master/<file>
-        # relpath = <telescope>/<object>/master/<file>
         return f"/img/{quote(os.path.relpath(path, ROOT))}"
+
+    # --- sortable header cells ---
+    header_cells = []
+    for key, name, sortable, _fn, _def_dir in COLUMNS:
+        arrow = ""
+        if sortable:
+            if key == sort_key:
+                arrow = "&#8593;" if direction == "asc" else "&#8595;"
+            else:
+                arrow = "&#8597;"
+            other_dir = "desc" if direction == "asc" else "asc"
+            if key == sort_key:
+                url = _pager_url(1, key, other_dir)
+            else:
+                url = _pager_url(1, key, COL_BY_KEY[key][4])
+            header_cells.append(
+                f'<th><a href="{url}">{html.escape(name)}<span class="arrow">{arrow}</span></a></th>'
+            )
+        else:
+            header_cells.append(f'<th>{html.escape(name)}</th>')
+
+    pager = render_pager(page, pages, total, sort_key, direction)
 
     return PAGE_TEMPLATE.format(
         root=html.escape(ROOT),
-        n=len(records),
+        n=total,
         gen=generated.strftime("%Y-%m-%d %H:%M:%S"),
         telescope_options=options,
         flashes=flashes,
-        rows=build_rows(records, image_url=image_url),
+        refresh_url=_pager_url(1, sort_key, direction) + "&refresh=1",
+        header_cells="\n".join(header_cells),
+        rows=build_rows(page_records, image_url=image_url),
+        pager=pager,
     )
 
 
