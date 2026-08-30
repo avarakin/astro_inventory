@@ -3,3 +3,6 @@ commands.log
 .venv/
 __pycache__/
 *.pyc
+.location
+GeoLite2-City.mmdb
+server.log

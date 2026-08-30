@@ -65,6 +65,7 @@ COLUMNS = [
     ("latest",  "Latest image",          True,  lambda r: (r["latest"].timestamp() if r["latest"] else 0), "desc"),
     ("telescope", "Telescope",           True,  lambda r: r["telescope"], "asc"),
     ("object",  "Object",                True,  lambda r: r["object"], "asc"),
+    ("transit", "Transit",               True,  lambda r: r.get("transit_sort") or 9999999999, "asc"),
     ("total",   "Total exposure",        True,  _total_seconds, "desc"),
     ("size",    "Size (MB)",             True,  lambda r: rec_size_mb(r), "desc"),
     ("filters", "Filters (count / duration / total)", False, None, None),

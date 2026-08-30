@@ -14,11 +14,114 @@ Row colors:
 import os
 import re
 import html
-from datetime import datetime
+import math
+import urllib.request
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 ROOT = "/data/Astro/CCD"
 OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory.html")
+
+# --- location detection (GeoLite2) -------------------------------------------
+
+_GEOIP_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "GeoLite2-City.mmdb")
+_LOCATION_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".location")
+
+
+def detect_longitude():
+    """Return the local longitude in degrees using GeoLite2 + public IP.
+    Cached in .location file so we only hit the network once."""
+    # try cache first
+    try:
+        with open(_LOCATION_CACHE) as f:
+            val = f.read().strip()
+        if val:
+            return float(val)
+    except (OSError, ValueError):
+        pass
+    # try GeoLite2
+    try:
+        import geoip2.database
+        ip = urllib.request.urlopen("https://api.ipify.org", timeout=10).read().decode().strip()
+        with geoip2.database.Reader(_GEOIP_DB) as reader:
+            city = reader.city(ip)
+            lon = city.location.longitude
+            with open(_LOCATION_CACHE, "w") as f:
+                f.write(str(lon))
+            return lon
+    except Exception as e:
+        print(f"WARNING: GeoIP lookup failed: {e}", flush=True)
+    return 0.0
+
+
+LONGITUDE = detect_longitude()
+
+
+# --- transit calculation ------------------------------------------------------
+
+def parse_ra_hours(text):
+    """Extract RA from plan.md text. Supports YAML frontmatter 'ra: 23h20m29s'
+    and old format '- **RA:** 23h20m29s'. Returns hours (float) or None."""
+    if not text:
+        return None
+    # try YAML frontmatter: ra: 23h20m29s
+    m = re.search(r"^ra:\s*(\d+)h(\d+)m(\d+)s", text, re.MULTILINE)
+    if not m:
+        # try old format: - **RA:** 23h20m29s
+        m = re.search(r"\*\*RA:\*\*\s*(\d+)h(\d+)m(\d+)s", text)
+    if not m:
+        return None
+    h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return h + mi / 60.0 + s / 3600.0
+
+
+def transit_date(ra_hours, lon_deg):
+    """Compute the upcoming date when an object with the given RA crosses the
+    local meridian at midnight. Returns a datetime or None.
+    
+    The object transits when LST = RA_object.
+    At local midnight, LST ≈ RA_sun + lon/15 + 12h (mod 24).
+    RA_sun advances ~0.263 h/day. We solve for the date when the equation holds.
+    """
+    # RA of the sun on a given date (approximate)
+    def ra_sun_hours(date):
+        # Julian date
+        jd = (date - datetime(2000, 1, 1, 12)).total_seconds() / 86400.0 + 2451543.5
+        n = jd - 2451543.5  # days since J2000
+        # mean longitude of the sun
+        L = (280.460 + 0.9856474 * n) % 360
+        # mean anomaly
+        M = (357.528 + 0.9856003 * n) % 360
+        # eccentricity of earth orbit
+        e = 0.0167
+        # mean longitude to ecliptic longitude
+        lambda_sun = L + (1.915 * math.sin(math.radians(M))
+                         + 0.020 * math.sin(math.radians(2 * M)))
+        lambda_sun = math.radians(lambda_sun % 360)
+        # RA = atan2(cos(eps)*sin(lambda), cos(lambda)) where eps = 23.44 deg
+        eps = math.radians(23.44)
+        ra = math.atan2(math.cos(eps) * math.sin(lambda_sun), math.cos(lambda_sun))
+        ra_hours = (math.degrees(ra) / 15.0) % 24
+        return ra_hours
+
+    # Find the next date when LST_midnight = RA_object
+    # At local solar midnight, LST ≈ RA_sun + 12h (independent of longitude,
+    # because local solar midnight is defined by the sun being at its lowest).
+    # We want: RA_sun + 12 ≡ RA_object (mod 24)
+    # => RA_sun ≡ RA_object - 12 (mod 24)
+    target_ra_sun = (ra_hours - 12.0) % 24
+
+    # Start from today, scan forward up to 366 days
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    for day_offset in range(0, 366):
+        d = today + timedelta(days=day_offset)
+        ra_s = ra_sun_hours(d)
+        # Check if RA_sun is within 0.5h of target (i.e. transit within ~12h of midnight)
+        diff = abs(ra_s - target_ra_sun)
+        diff = min(diff, 24 - diff)  # circular
+        if diff < 0.5:
+            return d
+    return None
 
 FILTERS = {
     "L": "Luminance",
@@ -217,6 +320,8 @@ def traverse(root):
 
                     # --- plan.md: object still to be captured ---
                     plan_path = os.path.join(obj_path, "plan.md")
+                    rec["transit"] = None
+                    rec["transit_sort"] = 0
                     if os.path.isfile(plan_path):
                         try:
                             st = os.stat(plan_path)
@@ -228,6 +333,13 @@ def traverse(root):
                         # If no images found, use plan.md mtime as latest
                         if rec["latest"] is None and rec.get("plan_mtime"):
                             rec["latest"] = rec["plan_mtime"]
+                        # compute transit date from RA in plan
+                        ra_h = parse_ra_hours(rec["plan"])
+                        if ra_h is not None:
+                            td = transit_date(ra_h, LONGITUDE)
+                            if td is not None:
+                                rec["transit"] = td.strftime("%Y-%m-%d")
+                                rec["transit_sort"] = td.timestamp()
                     else:
                         rec["plan"] = None
 
@@ -400,11 +512,15 @@ def build_rows(records, image_url=None, actions_url=None):
                 f'<form id="del_{idx}" method="post" action="{html.escape(delete_url)}" style="display:none"><input type="hidden" name="confirm" value="yes"></form>'
             )
 
+        transit_disp = rec.get("transit") or "—"
+        transit_sort = rec.get("transit_sort") or 0
+
         rows.append(
             f'<tr class="{cls}">'
             f'<td data-sort="{ts_sort}">{html.escape(ts_disp)}</td>'
             f'<td data-sort="{html.escape(rec["telescope"])}">{html.escape(rec["telescope"])}</td>'
             f'<td data-sort="{html.escape(rec["object"])}">{html.escape(rec["object"])}</td>'
+            f'<td data-sort="{transit_sort}">{html.escape(transit_disp)}</td>'
             f'<td data-sort="{total_sec}">{fmt_total(total_sec)}</td>'
             f'<td data-sort="{size_mb:.6f}">{size_mb:.1f}</td>'
             f'<td data-sort="">{filters_html}</td>'
