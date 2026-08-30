@@ -364,6 +364,12 @@ def build_rows(records):
         p_sort, p_disp = yn(rec["has_project"])
         f_sort, f_disp = yn(rec["has_final"])
 
+        plan_html = (
+            "<br>".join(html.escape(line) for line in rec["plan"].splitlines())
+            if rec["plan"]
+            else "—"
+        )
+
         size_mb = rec["size_bytes"] / (1024 * 1024)
 
         thumbs = []
@@ -386,7 +392,7 @@ def build_rows(records):
             f'<td data-sort="{p_sort}">{p_disp}</td>'
             f'<td data-sort="{f_sort}">{f_disp}</td>'
             f'<td data-sort="">{thumbs_html}</td>'
-            f'<td data-sort="">{html.escape(rec["plan"]) if rec["plan"] else "—"}</td>'
+            f'<td data-sort="">{plan_html}</td>'
             f"</tr>"
         )
     return "\n".join(rows)
