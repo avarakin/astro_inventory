@@ -14,12 +14,14 @@ Run:
 import os
 import re
 import html
+import json
 import shutil
 import threading
+import urllib.request
 from datetime import datetime
 from urllib.parse import quote, urlencode
 
-from flask import Flask, request, redirect, url_for, flash, get_flashed_messages, send_file, render_template_string
+from flask import Flask, request, redirect, url_for, flash, get_flashed_messages, send_file, render_template_string, jsonify
 
 from astro_inventory import ROOT, traverse, build_rows  # noqa: F401
 
@@ -205,6 +207,53 @@ def delete_object(telescope, name):
     return redirect(url_for("index"))
 
 
+@app.route("/astrobin/<slug>")
+def astrobin_lookup(slug):
+    """Look up an AstroBin image by slug (hash) and return name/constellation/RA/DEC."""
+    url = f"https://www.astrobin.com/api/v2/images/image/?hash={quote(slug)}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (astro-inventory)"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return jsonify({"error": f"AstroBin API request failed: {e}"}), 502
+
+    results = data.get("results") or []
+    if not results:
+        return jsonify({"error": f"No AstroBin image found for slug '{slug}'"}), 404
+
+    img = results[0]
+    sol = img.get("solution") or {}
+
+    # Convert RA from decimal degrees to HMS
+    ra_str = ""
+    if sol.get("ra") is not None:
+        ra_deg = float(sol["ra"]) % 360
+        total_sec = ra_deg * 240  # seconds of time
+        h = int(total_sec // 3600)
+        m = int((total_sec % 3600) // 60)
+        s = int(total_sec % 60)
+        ra_str = f"{h:02d}h{m:02d}m{s:02d}s"
+
+    # Convert DEC from decimal degrees to DMS
+    dec_str = ""
+    if sol.get("dec") is not None:
+        dec_deg = float(sol["dec"])
+        sign = "+" if dec_deg >= 0 else "-"
+        dec_abs = abs(dec_deg)
+        d = int(dec_abs)
+        m = int((dec_abs - d) * 60)
+        s = int(((dec_abs - d) * 60 - m) * 60)
+        dec_str = f"{sign}{d}\u00b0{m:02d}\u2032{s:02d}\u2033"
+
+    return jsonify({
+        "name": img.get("title") or "",
+        "constellation": img.get("constellation") or "",
+        "ra": ra_str,
+        "dec": dec_str,
+    })
+
+
 @app.route("/add", methods=["POST"])
 def add_object():
     telescope = (request.form.get("telescope") or "").strip()
@@ -238,19 +287,22 @@ def add_object():
     try:
         os.makedirs(obj_dir)
         with open(plan_path, "w", encoding="utf-8") as f:
-            f.write(f"# {name}\n\n")
+            fm = []
             if constellation:
-                f.write(f"- **Constellation:** {constellation}\n")
+                fm.append(f"constellation: {constellation}")
             if ra:
-                f.write(f"- **RA:** {ra}\n")
+                fm.append(f"ra: {ra}")
             if dec:
-                f.write(f"- **DEC:** {dec}\n")
+                fm.append(f"dec: {dec}")
             if rotation:
-                f.write(f"- **Rotation:** {rotation}\n")
+                fm.append(f"rotation: {rotation}")
             if sample:
-                f.write(f"- **Sample:** {sample}\n")
-            if constellation or ra or dec or rotation or sample:
-                f.write("\n")
+                fm.append(f"link: {sample}")
+            if fm:
+                f.write("---\n")
+                f.write("\n".join(fm) + "\n")
+                f.write("---\n\n")
+            f.write(f"# {name}\n\n## Plan\n")
     except OSError as e:
         flash(f"Failed to create {obj_dir}: {e}", "error")
         return redirect(url_for("index"))
@@ -323,10 +375,32 @@ Click a column header to sort. <a href="{refresh_url}">Refresh scan</a></p>
     <input type="text" name="dec" id="dec" placeholder="e.g. +41°16′09″">
     <label for="rotation">Rotation:</label>
     <input type="number" name="rotation" id="rotation" placeholder="e.g. 45" step="any">
-    <label for="sample">Sample:</label>
-    <input type="text" name="sample" id="sample" placeholder="e.g. 2x2 binning">
+    <label for="sample">Link:</label>
+    <input type="text" name="sample" id="sample" placeholder="e.g. https://app.astrobin.com/...">
+    <button type="button" id="populate-btn">Populate from Astrobin</button>
     <button type="submit">Add</button>
   </form>
+  <script>
+  document.getElementById('populate-btn').addEventListener('click', function() {{
+    var link = document.getElementById('sample').value.trim();
+    if (!link) {{ alert('Please enter an AstroBin link first.'); return; }}
+    var slug = link.split('/').filter(Boolean).pop();
+    if (!slug) {{ alert('Could not extract slug from link.'); return; }}
+    this.disabled = true; this.textContent = 'Loading...';
+    fetch('/astrobin/' + encodeURIComponent(slug))
+      .then(function(r) {{ return r.json().then(function(d) {{ return {{ok: r.ok, data: d}}; }}); }})
+      .then(function(res) {{
+        if (!res.ok) throw new Error(res.data.error || 'Lookup failed');
+        var d = res.data;
+        if (d.name) document.getElementById('object').value = d.name;
+        if (d.constellation) document.getElementById('constellation').value = d.constellation;
+        if (d.ra) document.getElementById('ra').value = d.ra;
+        if (d.dec) document.getElementById('dec').value = d.dec;
+      }})
+      .catch(function(e) {{ alert('AstroBin lookup failed: ' + e.message); }})
+      .finally(function() {{ document.getElementById('populate-btn').disabled = false; document.getElementById('populate-btn').textContent = 'Populate from Astrobin'; }});
+  }});
+  </script>
   {flashes}
 </div>
 
