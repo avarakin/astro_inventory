@@ -17,6 +17,7 @@ import html
 import math
 import urllib.request
 from datetime import datetime, timedelta
+from tzlocal import get_localzone
 from collections import defaultdict
 
 ROOT = "/data/Astro/CCD"
@@ -76,52 +77,63 @@ def parse_ra_hours(text):
 
 
 def transit_date(ra_hours, lon_deg):
-    """Compute the upcoming date when an object with the given RA crosses the
-    local meridian at midnight. Returns a datetime or None.
-    
-    The object transits when LST = RA_object.
-    At local midnight, LST ≈ RA_sun + lon/15 + 12h (mod 24).
-    RA_sun advances ~0.263 h/day. We solve for the date when the equation holds.
     """
-    # RA of the sun on a given date (approximate)
-    def ra_sun_hours(date):
-        # Julian date
-        jd = (date - datetime(2000, 1, 1, 12)).total_seconds() / 86400.0 + 2451543.5
-        n = jd - 2451543.5  # days since J2000
-        # mean longitude of the sun
-        L = (280.460 + 0.9856474 * n) % 360
-        # mean anomaly
-        M = (357.528 + 0.9856003 * n) % 360
-        # eccentricity of earth orbit
-        e = 0.0167
-        # mean longitude to ecliptic longitude
-        lambda_sun = L + (1.915 * math.sin(math.radians(M))
-                         + 0.020 * math.sin(math.radians(2 * M)))
-        lambda_sun = math.radians(lambda_sun % 360)
-        # RA = atan2(cos(eps)*sin(lambda), cos(lambda)) where eps = 23.44 deg
-        eps = math.radians(23.44)
-        ra = math.atan2(math.cos(eps) * math.sin(lambda_sun), math.cos(lambda_sun))
-        ra_hours = (math.degrees(ra) / 15.0) % 24
-        return ra_hours
+    Find the upcoming date when an object transits at local civil midnight.
 
-    # Find the next date when LST_midnight = RA_object
-    # At local solar midnight, LST ≈ RA_sun + 12h (independent of longitude,
-    # because local solar midnight is defined by the sun being at its lowest).
-    # We want: RA_sun + 12 ≡ RA_object (mod 24)
-    # => RA_sun ≡ RA_object - 12 (mod 24)
-    target_ra_sun = (ra_hours - 12.0) % 24
+    Scans forward from today, computing LST at local midnight each night.
+    Returns the date (datetime) where LST_midnight is closest to RA_object,
+    i.e. the object crosses the meridian at ~midnight.
 
-    # Start from today, scan forward up to 366 days
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    for day_offset in range(0, 366):
-        d = today + timedelta(days=day_offset)
-        ra_s = ra_sun_hours(d)
-        # Check if RA_sun is within 0.5h of target (i.e. transit within ~12h of midnight)
-        diff = abs(ra_s - target_ra_sun)
-        diff = min(diff, 24 - diff)  # circular
-        if diff < 0.5:
-            return d
-    return None
+    Uses tzlocal to detect the system timezone (handles DST automatically).
+    """
+
+    def gmst_hours(dt):
+        jd = dt.timestamp() / 86400.0 + 2440587.5
+        d = jd - 2451545.0
+        gmst = (18.697374558 + 24.06570982441908 * d) % 24.0
+        return gmst
+
+    def lst_hours(dt):
+        return (gmst_hours(dt) + lon_deg / 15.0) % 24.0
+
+    def circ_diff(a, b):
+        d = abs(a - b) % 24.0
+        return min(d, 24.0 - d)
+
+    tz = get_localzone()
+    now = datetime.now(tz)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Scan forward up to 366 days; find the midnight where
+    # LST is closest to RA_object (transit closest to midnight)
+    best = None
+    best_diff = 999.0
+    for day in range(366):
+        m = midnight + timedelta(days=day)
+        diff = circ_diff(lst_hours(m), ra_hours)
+        if diff < best_diff:
+            best_diff = diff
+            best = m
+    if best is None:
+        return None
+
+    # Refine: bisect to find the exact midnight closest to transit
+    t0 = best - timedelta(days=1.5)
+    t1 = best + timedelta(days=1.5)
+
+    def f(t):
+        return circ_diff(lst_hours(t), ra_hours)
+
+    for _ in range(50):
+        tm = t0 + (t1 - t0) / 2
+        if f(t0) <= f(tm):
+            t1 = tm
+        else:
+            t0 = tm
+        if (t1 - t0) < timedelta(days=0.01):
+            break
+    tm = t0 + (t1 - t0) / 2
+    return tm.replace(hour=0, minute=0, second=0, microsecond=0)
 
 FILTERS = {
     "L": "Luminance",
