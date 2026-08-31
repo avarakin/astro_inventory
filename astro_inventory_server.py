@@ -326,7 +326,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; }}
   th {{ background: #2b3a55; color: #fff; position: sticky; top: 0; user-select: none; }}
   th a {{ color: #fff; text-decoration: none; }}
-  th .arrow {{ display: inline-block; width: 14px; font-size: 11px; opacity: 0.6; }}
+  th .arrow {{ display: inline-block; font-size: 18px; font-weight: bold; margin-left: 6px; vertical-align: middle; }}
   tr:nth-child(even) {{ background: #f4f6fa; }}
   tr.red {{ background: #f8d7da !important; }}
   tr.yellow {{ background: #fff3cd !important; }}

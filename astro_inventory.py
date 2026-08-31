@@ -373,7 +373,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; }}
   th {{ background: #2b3a55; color: #fff; cursor: pointer; position: sticky; top: 0; user-select: none; }}
   th:hover {{ background: #3d5177; }}
-  th .arrow {{ display: inline-block; width: 14px; font-size: 11px; opacity: 0.6; }}
+  th .arrow {{ display: block; font-size: 20px; font-weight: bold; text-align: center; margin-top: 2px; }}
+  .btn {{ padding: 4px 10px; font-size: 12px; border: none; border-radius: 4px; cursor: pointer; }}
+  .btn-edit {{ background: #4a90d9; color: #fff; }}
+  .btn-edit:hover {{ background: #357abd; }}
+  .btn-del {{ background: #d9534f; color: #fff; }}
+  .btn-del:hover {{ background: #c9302c; }}
   tr:nth-child(even) {{ background: #f4f6fa; }}
   tr.red {{ background: #f8d7da !important; }}
   tr.yellow {{ background: #fff3cd !important; }}
@@ -516,11 +521,10 @@ def build_rows(records, image_url=None, actions_url=None):
             edit_url, delete_url = actions_url(rec["telescope"], rec["object"])
             obj_label = html.escape(rec["telescope"] + "/" + rec["object"])
             actions_html = (
-                f'<a href="{html.escape(edit_url)}">Edit plan</a>'
-                f' <span class="sep">|</span> '
-                f'<a class="del" href="{html.escape(delete_url)}" '
-                f'onclick="event.preventDefault();if(confirm(\'Delete {obj_label} and all its files? This cannot be undone.\'))document.getElementById(\'del_{idx}\').submit();return false">'
-                f'Delete directory</a>'
+                f'<button class="btn btn-edit" onclick="window.open(\'{html.escape(edit_url)}\', \'_blank\')">Edit plan</button> '
+                f'<button class="btn btn-del" '
+                f'onclick="if(confirm(\'Delete {obj_label} and all its files? This cannot be undone.\'))document.getElementById(\'del_{idx}\').submit();return false">'
+                f'Delete directory</button>'
                 f'<form id="del_{idx}" method="post" action="{html.escape(delete_url)}" style="display:none"><input type="hidden" name="confirm" value="yes"></form>'
             )
 
