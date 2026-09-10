@@ -385,6 +385,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .total {{ font-weight: bold; }}
   .meta {{ color: #666; margin-bottom: 1em; }}
   .thumbs img {{ max-height: 60px; max-width: 120px; margin: 2px; border: 1px solid #999; vertical-align: middle; }}
+  .plan {{ font-size: 12px; }}
+  .plan-top {{ margin-bottom: 4px; }}
+  .badge {{ display: inline-block; background: #2b3a55; color: #fff; border-radius: 3px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-right: 6px; }}
+  .plan-link {{ display: inline-block; padding: 1px 8px; background: #4a90d9; color: #fff; border-radius: 4px; text-decoration: none; font-size: 11px; }}
+  .plan-link:hover {{ background: #357abd; }}
+  .plan-body {{ margin: 2px 0; line-height: 1.4; }}
+  .plan-meta {{ color: #666; font-size: 11px; margin-top: 3px; }}
 </style>
 </head>
 <body>
@@ -455,6 +462,73 @@ sortTable(0, -1);
 """
 
 
+_URL_RE = re.compile(r"https?://[^\s<>\"']+")
+
+
+def linkify(escaped_text):
+    """Wrap http(s) URLs in already-escaped text with target=_blank anchors."""
+    return _URL_RE.sub(
+        lambda m: f'<a href="{m.group(0)}" target="_blank" rel="noopener noreferrer">{m.group(0)}</a>',
+        escaped_text,
+    )
+
+
+def _parse_plan(text):
+    """Split a plan.md into (meta_dict, body). meta keys lowercased.
+    Returns ({}, text) when there is no YAML frontmatter."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+    meta = {}
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            body = "\n".join(
+                l for l in lines[i + 1:] if not l.lstrip().startswith("#")
+            )
+            return meta, body.strip()
+        if ":" in lines[i]:
+            k, v = lines[i].split(":", 1)
+            meta[k.strip().lower()] = v.strip()
+    return {}, text
+
+
+def _plan_link_label(url):
+    return "AstroBin" if "astrobin" in url.lower() else "Link"
+
+
+def render_plan(plan_text):
+    """Render a plan.md string as a compact, styled HTML block."""
+    if not plan_text or not plan_text.strip():
+        return "—"
+    meta, body = _parse_plan(plan_text)
+    top = []
+    if meta.get("constellation"):
+        top.append(f'<span class="badge">{html.escape(meta["constellation"])}</span>')
+    if meta.get("link"):
+        url = meta["link"]
+        top.append(
+            f'<a class="plan-link" href="{html.escape(url)}" '
+            f'target="_blank" rel="noopener noreferrer">{html.escape(_plan_link_label(url))} &#8599;</a>'
+        )
+    parts = []
+    if top:
+        parts.append(f'<div class="plan-top">{"".join(top)}</div>')
+    if body:
+        body_html = "<br>".join(linkify(html.escape(l)) for l in body.splitlines())
+        parts.append(f'<div class="plan-body">{body_html}</div>')
+    meta_bits = [
+        f"RA {meta['ra']}" if meta.get("ra") else "",
+        f"Dec {meta['dec']}" if meta.get("dec") else "",
+        f"Rot {meta['rotation']}" if meta.get("rotation") else "",
+    ]
+    meta_bits = [b for b in meta_bits if b]
+    if meta_bits:
+        parts.append(f'<div class="plan-meta">{" · ".join(html.escape(b) for b in meta_bits)}</div>')
+    if not parts:
+        return linkify(html.escape(plan_text))
+    return '<div class="plan">' + "".join(parts) + "</div>"
+
+
 def build_rows(records, image_url=None, actions_url=None):
     """image_url: callable(path) -> url for final images; default is file://
     actions_url: callable(telescope, object) -> (edit_url, delete_url) or None"""
@@ -498,11 +572,7 @@ def build_rows(records, image_url=None, actions_url=None):
         p_sort, p_disp = yn(rec["has_project"])
         f_sort, f_disp = yn(rec["has_final"])
 
-        plan_html = (
-            "<br>".join(html.escape(line) for line in rec["plan"].splitlines())
-            if rec["plan"]
-            else "—"
-        )
+        plan_html = render_plan(rec["plan"])
 
         size_mb = rec["size_bytes"] / (1024 * 1024)
 

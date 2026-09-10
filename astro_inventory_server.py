@@ -332,6 +332,13 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   tr.yellow {{ background: #fff3cd !important; }}
   .meta {{ color: #666; margin-bottom: 1em; }}
   .thumbs img {{ max-height: 60px; max-width: 120px; margin: 2px; border: 1px solid #999; vertical-align: middle; }}
+  .plan {{ font-size: 12px; }}
+  .plan-top {{ margin-bottom: 4px; }}
+  .badge {{ display: inline-block; background: #2b3a55; color: #fff; border-radius: 3px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-right: 6px; }}
+  .plan-link {{ display: inline-block; padding: 1px 8px; background: #4a90d9; color: #fff; border-radius: 4px; text-decoration: none; font-size: 11px; }}
+  .plan-link:hover {{ background: #357abd; }}
+  .plan-body {{ margin: 2px 0; line-height: 1.4; }}
+  .plan-meta {{ color: #666; font-size: 11px; margin-top: 3px; }}
   .addbox {{ border: 1px solid #ccc; border-radius: 6px; padding: 1em 1.2em; margin-bottom: 1.5em; background: #f7f9fc; }}
   .addbox h2 {{ margin: 0 0 0.8em; font-size: 1.1em; }}
   .addbox form {{ display: flex; align-items: center; gap: 0.6em; flex-wrap: wrap; }}
@@ -534,4 +541,4 @@ def render_page(page_records, generated, telescopes, total, page, pages, sort_ke
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False)
