@@ -16,6 +16,7 @@ import re
 import html
 import json
 import shutil
+import argparse
 import threading
 import urllib.request
 from datetime import datetime
@@ -23,7 +24,8 @@ from urllib.parse import quote, urlencode
 
 from flask import Flask, request, redirect, url_for, flash, get_flashed_messages, send_file, render_template_string, jsonify
 
-from astro_inventory import ROOT, traverse, build_rows  # noqa: F401
+import astro_inventory
+from astro_inventory import traverse, build_rows  # noqa: F401
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -46,7 +48,7 @@ _cache = {"records": None, "generated": None}
 def get_records(force=False):
     with _cache_lock:
         if force or _cache["records"] is None:
-            records = traverse(ROOT)
+            records = traverse(astro_inventory.ROOT)
             _cache["records"] = records
             _cache["generated"] = datetime.now()
     return _cache["records"], _cache["generated"]
@@ -125,8 +127,8 @@ def index():
 @app.route("/img/<path:relpath>")
 def image(relpath):
     # only serve files that live under ROOT
-    full = os.path.realpath(os.path.join(ROOT, relpath))
-    if not full.startswith(os.path.realpath(ROOT) + os.sep):
+    full = os.path.realpath(os.path.join(astro_inventory.ROOT, relpath))
+    if not full.startswith(os.path.realpath(astro_inventory.ROOT) + os.sep):
         return "Not found", 404
     if not os.path.isfile(full):
         return "Not found", 404
@@ -140,14 +142,14 @@ def _resolve_object(telescope, name):
         return None, "Invalid telescope name."
     if re.search(r"[\x00/\\]", name) or name in ("", ".", ".."):
         return None, "Invalid object name."
-    tel_dir = os.path.join(ROOT, telescope)
+    tel_dir = os.path.join(astro_inventory.ROOT, telescope)
     obj_dir = os.path.join(tel_dir, name)
     if not os.path.isdir(tel_dir):
         return None, f"Telescope directory not found: {telescope}"
     if not os.path.isdir(obj_dir):
         return None, f"Object directory not found: {telescope}/{name}"
     # make sure the resolved path stays under ROOT
-    if not os.path.realpath(obj_dir).startswith(os.path.realpath(ROOT) + os.sep):
+    if not os.path.realpath(obj_dir).startswith(os.path.realpath(astro_inventory.ROOT) + os.sep):
         return None, "Invalid path."
     return obj_dir, None
 
@@ -270,7 +272,7 @@ def add_object():
         return redirect(url_for("index"))
 
     # only allow telescope names that actually exist in ROOT
-    if not os.path.isdir(os.path.join(ROOT, telescope)):
+    if not os.path.isdir(os.path.join(astro_inventory.ROOT, telescope)):
         flash(f"Telescope directory not found: {telescope}", "error")
         return redirect(url_for("index"))
 
@@ -279,7 +281,7 @@ def add_object():
         flash("Invalid object name.", "error")
         return redirect(url_for("index"))
 
-    obj_dir = os.path.join(ROOT, telescope, name)
+    obj_dir = os.path.join(astro_inventory.ROOT, telescope, name)
     if os.path.exists(obj_dir):
         flash(f"Object directory already exists: {telescope}/{name}", "error")
         return redirect(url_for("index"))
@@ -361,7 +363,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Astronomy Capture Report</h1>
+<h1>Astro Imaging Tracker</h1>
 <p class="meta">Root: {root} &middot; Objects: {n} &middot; Generated: {gen}<br>
 Click a column header to sort. <a href="{refresh_url}">Refresh scan</a></p>
 
@@ -497,7 +499,7 @@ def render_page(page_records, generated, telescopes, total, page, pages, sort_ke
 
     def image_url(path):
         # path is under ROOT: /data/Astro/CCD/<telescope>/<object>/master/<file>
-        return f"/img/{quote(os.path.relpath(path, ROOT))}"
+        return f"/img/{quote(os.path.relpath(path, astro_inventory.ROOT))}"
 
     def actions_url(tel, name):
         return (
@@ -528,7 +530,7 @@ def render_page(page_records, generated, telescopes, total, page, pages, sort_ke
     pager = render_pager(page, pages, total, sort_key, direction)
 
     return PAGE_TEMPLATE.format(
-        root=html.escape(ROOT),
+        root=html.escape(astro_inventory.ROOT),
         n=total,
         gen=generated.strftime("%Y-%m-%d %H:%M:%S"),
         telescope_options=options,
@@ -541,4 +543,8 @@ def render_page(page_records, generated, telescopes, total, page, pages, sort_ke
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Astronomy image inventory server")
+    parser.add_argument("--root", required=True, help="Root directory for CCD data")
+    args = parser.parse_args()
+    astro_inventory.ROOT = args.root
     app.run(host="0.0.0.0", port=5000, debug=False)

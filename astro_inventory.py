@@ -15,12 +15,13 @@ import os
 import re
 import html
 import math
+import argparse
 import urllib.request
 from datetime import datetime, timedelta
 from tzlocal import get_localzone
 from collections import defaultdict
 
-ROOT = "/data/Astro/CCD"
+ROOT = None
 OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory.html")
 
 # --- location detection (GeoLite2) -------------------------------------------
@@ -395,7 +396,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Astronomy Capture Report</h1>
+<h1>Astro Imaging Tracker</h1>
 <p class="meta">Root: {root} &middot; Objects: {n} &middot; Generated: {gen}<br>
 Click a column header to sort (click again to reverse). Default: Latest image, descending.</p>
 <table id="report">
@@ -621,6 +622,12 @@ def build_rows(records, image_url=None, actions_url=None):
 
 
 def main():
+    global ROOT
+    parser = argparse.ArgumentParser(description="Astronomy image inventory generator")
+    parser.add_argument("--root", required=True, help="Root directory for CCD data")
+    args = parser.parse_args()
+    ROOT = args.root
+
     print(f"Scanning {ROOT} ...")
     records = traverse(ROOT)
     print(f"Found {len(records)} objects")
