@@ -25,7 +25,7 @@ from urllib.parse import quote, urlencode
 from flask import Flask, request, redirect, url_for, flash, get_flashed_messages, send_file, render_template_string, jsonify
 
 import astro_inventory
-from astro_inventory import traverse, build_rows  # noqa: F401
+from astro_inventory import traverse, build_rows, expand_constellation  # noqa: F401
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -251,7 +251,7 @@ def astrobin_lookup(slug):
 
     return jsonify({
         "name": img.get("title") or "",
-        "constellation": img.get("constellation") or "",
+        "constellation": expand_constellation(img.get("constellation") or ""),
         "ra": ra_str,
         "dec": dec_str,
     })
@@ -292,7 +292,7 @@ def add_object():
         with open(plan_path, "w", encoding="utf-8") as f:
             fm = []
             if constellation:
-                fm.append(f"constellation: {constellation}")
+                fm.append(f"constellation: {expand_constellation(constellation)}")
             if ra:
                 fm.append(f"ra: {ra}")
             if dec:

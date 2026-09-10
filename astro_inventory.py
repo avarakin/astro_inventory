@@ -146,6 +146,109 @@ FILTERS = {
     "H": "Ha",
 }
 
+# --- constellation abbreviation expansion -------------------------------------
+
+CONSTELLATIONS = {
+    "And": "Andromeda",
+    "Ant": "Antlia",
+    "Aps": "Apus",
+    "Ape": "Apus",
+    "Aqr": "Aquarius",
+    "Aql": "Aquila",
+    "Ara": "Ara",
+    "Ari": "Aries",
+    "Aur": "Auriga",
+    "Boo": "Bootes",
+    "Cae": "Caelum",
+    "Cam": "Camelopardalis",
+    "Cap": "Capricornus",
+    "Car": "Carina",
+    "Cen": "Centaurus",
+    "Cet": "Cetus",
+    "Cha": "Chamaeleon",
+    "Cir": "Circinus",
+    "Col": "Columba",
+    "Com": "Coma Berenices",
+    "Crt": "Crater",
+    "CVn": "Canes Venatici",
+    "CMi": "Canis Minor",
+    "CMa": "Canis Major",
+    "Crt": "Cancer",
+    "Crt2": "Crater",
+    "Cas": "Cassiopeia",
+    "Cep": "Cepheus",
+    "CrA": "Corona Australis",
+    "CrB": "Corona Borealis",
+    "Crv": "Corvus",
+    "Cru": "Crux",
+    "Cyg": "Cygnus",
+    "Del": "Delphinus",
+    "Dor": "Dorado",
+    "Dra": "Draco",
+    "Equ": "Equuleus",
+    "Eri": "Eridanus",
+    "For": "Fornax",
+    "Gem": "Gemini",
+    "Grus": "Grus",
+    "Her": "Hercules",
+    "Hor": "Horologium",
+    "Hya": "Hydra",
+    "Hyi": "Hydrus",
+    "Ind": "Indus",
+    "Lac": "Lacerta",
+    "Leo": "Leo",
+    "LMi": "Leo Minor",
+    "Lep": "Lepus",
+    "Lib": "Libra",
+    "Lup": "Lupus",
+    "Lyn": "Lynx",
+    "Lyr": "Lyra",
+    "Men": "Mensa",
+    "Mic": "Microscopium",
+    "Mon": "Monoceros",
+    "Mus": "Musca",
+    "Nor": "Norma",
+    "Oct": "Octans",
+    "Oph": "Ophiuchus",
+    "Ori": "Orion",
+    "Pav": "Pavo",
+    "Peg": "Pegasus",
+    "Per": "Perseus",
+    "Phe": "Phoenix",
+    "Pic": "Pictor",
+    "Psc": "Pisces",
+    "PsA": "Piscis Austrinus",
+    "Pup": "Puppis",
+    "Pyx": "Pyxis",
+    "Rta": "Reticulum",
+    "Sge": "Sagitta",
+    "Sgr": "Sagittarius",
+    "Sco": "Scorpius",
+    "Scl": "Sculptor",
+    "Sct": "Scutum",
+    "Ser": "Serpens",
+    "Sex": "Sextans",
+    "Tau": "Taurus",
+    "Tel": "Telescopium",
+    "Tri": "Triangulum",
+    "TrA": "Triangulum Australe",
+    "Tuc": "Tucana",
+    "UMi": "Ursa Minor",
+    "UMa": "Ursa Major",
+    "Vel": "Vela",
+    "Vir": "Virgo",
+    "Vul": "Vulpecula",
+    "Vol": "Volans",
+}
+
+
+def expand_constellation(value):
+    """Expand a constellation abbreviation to its full name.
+    Unknown values are returned unchanged."""
+    if not value:
+        return value
+    return CONSTELLATIONS.get(value.strip(), value)
+
 # --- filename parsing -------------------------------------------------------
 
 # exposure duration patterns: "_300s_", "_1200_Seconds_", "_1200s_1x1_",
@@ -504,7 +607,7 @@ def render_plan(plan_text):
     meta, body = _parse_plan(plan_text)
     top = []
     if meta.get("constellation"):
-        top.append(f'<span class="badge">{html.escape(meta["constellation"])}</span>')
+        top.append(f'<span class="badge">{html.escape(expand_constellation(meta["constellation"]))}</span>')
     if meta.get("link"):
         url = meta["link"]
         top.append(
@@ -514,9 +617,6 @@ def render_plan(plan_text):
     parts = []
     if top:
         parts.append(f'<div class="plan-top">{"".join(top)}</div>')
-    if body:
-        body_html = "<br>".join(linkify(html.escape(l)) for l in body.splitlines())
-        parts.append(f'<div class="plan-body">{body_html}</div>')
     meta_bits = [
         f"RA {meta['ra']}" if meta.get("ra") else "",
         f"Dec {meta['dec']}" if meta.get("dec") else "",
@@ -524,7 +624,10 @@ def render_plan(plan_text):
     ]
     meta_bits = [b for b in meta_bits if b]
     if meta_bits:
-        parts.append(f'<div class="plan-meta">{" · ".join(html.escape(b) for b in meta_bits)}</div>')
+        parts.append(f'<div class="plan-meta">{"<br>".join(html.escape(b) for b in meta_bits)}</div>')
+    if body:
+        body_html = "<br>".join(linkify(html.escape(l)) for l in body.splitlines())
+        parts.append(f'<div class="plan-body">{body_html}</div>')
     if not parts:
         return linkify(html.escape(plan_text))
     return '<div class="plan">' + "".join(parts) + "</div>"
