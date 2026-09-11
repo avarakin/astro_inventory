@@ -321,7 +321,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Astro Capture Report</title>
+<title>Astro Imaging Tracker</title>
 <style>
   :root {{
     --bg: #0b1020;
@@ -485,7 +485,7 @@ PAGE_SHELL = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Astro Capture Report</title>
+<title>Astro Imaging Tracker</title>
 <style>
   :root {
     --bg: #0b1020; --panel: #131a2e; --panel-2: #1a2340; --border: #26314f;
