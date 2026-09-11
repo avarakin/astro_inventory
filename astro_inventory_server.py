@@ -527,6 +527,20 @@ def _pager_url(page, sort_key, direction, page_size):
     return "?" + urlencode(params)
 
 
+def _page_size_control(page_size, sort_key, direction):
+    options = [(10, "10"), (20, "20"), (50, "50"), (100, "100"), (0, "All (no paging)")]
+    opts = "".join(
+        f'<option value="{v}"{" selected" if v == page_size else ""}>{label}</option>'
+        for v, label in options
+    )
+    base = _pager_url(1, sort_key, direction, 20).rsplit("&page_size=", 1)[0]
+    return (
+        f'<span class="page-size">Page size: '
+        f'<select onchange="window.location.href=\'{base}&page_size=\'+this.value">'
+        f"{opts}</select></span>"
+    )
+
+
 def render_pager(page, pages, total, sort_key, direction, page_size):
     if page_size == 0:
         return f"<span>{total} objects (paging disabled)</span>"
@@ -597,6 +611,7 @@ def render_page(page_records, generated, telescopes, total, page, pages, page_si
             header_cells.append(f'<th>{html.escape(name)}</th>')
 
     pager = render_pager(page, pages, total, sort_key, direction, page_size)
+    pager = _page_size_control(page_size, sort_key, direction) + " " + pager
 
     return PAGE_TEMPLATE.format(
         root=html.escape(astro_inventory.ROOT),
