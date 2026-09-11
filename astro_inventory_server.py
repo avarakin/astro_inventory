@@ -530,7 +530,7 @@ def _index_return_url():
             from urllib.parse import urlparse
             p = urlparse(ref)
             if p.path == "/":
-                return "?" + p.query
+                return "/?" + p.query
         except Exception:
             pass
     return "?"
