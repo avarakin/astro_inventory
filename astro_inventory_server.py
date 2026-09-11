@@ -323,43 +323,90 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Astro Capture Report</title>
 <style>
-  body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 2em; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
-  th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; }}
-  th {{ background: #2b3a55; color: #fff; position: sticky; top: 0; user-select: none; }}
-  th a {{ color: #fff; text-decoration: none; }}
-  th .arrow {{ display: inline-block; font-size: 18px; font-weight: bold; margin-left: 6px; vertical-align: middle; }}
-  tr:nth-child(even) {{ background: #f4f6fa; }}
-  tr.red {{ background: #f8d7da !important; }}
-  tr.yellow {{ background: #fff3cd !important; }}
-  .meta {{ color: #666; margin-bottom: 1em; }}
-  .thumbs img {{ max-height: 60px; max-width: 120px; margin: 2px; border: 1px solid #999; vertical-align: middle; }}
+  :root {{
+    --bg: #0b1020;
+    --panel: #131a2e;
+    --panel-2: #1a2340;
+    --border: #26314f;
+    --text: #e6ebf5;
+    --muted: #8b96b3;
+    --accent: #7c8cff;
+    --accent-2: #5a6cf0;
+    --ok-bg: #10331f; --ok-fg: #6ee7a0;
+    --err-bg: #3a1520; --err-fg: #ff9db1;
+    --warn-bg: #3a2f10; --warn-fg: #ffd97a;
+    --red-bg: rgba(255, 99, 132, 0.12);
+    --yellow-bg: rgba(255, 209, 102, 0.10);
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    font-family: Inter, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    margin: 0; padding: 2em;
+    background: radial-gradient(1200px 600px at 80% -10%, #1b2547 0%, var(--bg) 55%) fixed, var(--bg);
+    color: var(--text);
+  }}
+  h1 {{ font-size: 1.6em; font-weight: 700; letter-spacing: 0.3px; margin: 0 0 0.5em; }}
+  a {{ color: var(--accent); }}
+  .meta {{ color: var(--muted); margin-bottom: 1.2em; font-size: 14px; }}
+  .meta a {{ text-decoration: none; }}
+  .meta a:hover {{ text-decoration: underline; }}
+  table {{ border-collapse: separate; border-spacing: 0; width: 100%; font-size: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }}
+  th, td {{ padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }}
+  th {{
+    background: var(--panel-2); color: var(--text);
+    position: sticky; top: 0; user-select: none; font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600;
+  }}
+  th a {{ color: var(--text); text-decoration: none; }}
+  th a:hover {{ color: var(--accent); }}
+  th .arrow {{ display: inline-block; font-size: 15px; font-weight: bold; margin-left: 6px; vertical-align: middle; color: var(--accent); }}
+  tbody tr {{ background: transparent; transition: background 0.12s; }}
+  tbody tr:hover {{ background: rgba(124, 140, 255, 0.07); }}
+  tr.red {{ background: var(--red-bg) !important; }}
+  tr.yellow {{ background: var(--yellow-bg) !important; }}
+  .thumbs img {{ max-height: 60px; max-width: 120px; margin: 2px; border: 1px solid var(--border); border-radius: 4px; vertical-align: middle; }}
   .plan {{ font-size: 12px; }}
   .plan-top {{ margin-bottom: 4px; }}
-  .badge {{ display: inline-block; background: #2b3a55; color: #fff; border-radius: 3px; padding: 1px 7px; font-size: 11px; font-weight: 600; margin-right: 6px; }}
-  .plan-link {{ display: inline-block; padding: 1px 8px; background: #4a90d9; color: #fff; border-radius: 4px; text-decoration: none; font-size: 11px; }}
-  .plan-link:hover {{ background: #357abd; }}
+  .badge {{ display: inline-block; background: var(--accent-2); color: #fff; border-radius: 10px; padding: 2px 9px; font-size: 11px; font-weight: 600; margin-right: 6px; }}
+  .plan-link {{ display: inline-block; padding: 2px 10px; background: var(--accent-2); color: #fff; border-radius: 10px; text-decoration: none; font-size: 11px; font-weight: 600; }}
+  .plan-link:hover {{ background: var(--accent); }}
   .plan-body {{ margin: 2px 0; line-height: 1.4; }}
-  .plan-meta {{ color: #666; font-size: 11px; margin-top: 3px; }}
-  .addbox {{ border: 1px solid #ccc; border-radius: 6px; padding: 1em 1.2em; margin-bottom: 1.5em; background: #f7f9fc; }}
-  .addbox h2 {{ margin: 0 0 0.8em; font-size: 1.1em; }}
+  .plan-meta {{ color: var(--muted); font-size: 11px; margin-top: 3px; }}
+  .btn {{ padding: 6px 14px; font-size: 13px; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }}
+  .btn-edit {{ background: var(--accent-2); color: #fff; }}
+  .btn-edit:hover {{ background: var(--accent); }}
+  .btn-del {{ background: #e05268; color: #fff; }}
+  .btn-del:hover {{ background: #f06a7d; }}
+  .addbox {{ border: 1px solid var(--border); border-radius: 12px; padding: 1.2em 1.4em; margin-bottom: 1.5em; background: var(--panel); }}
+  .addbox h2 {{ margin: 0 0 0.9em; font-size: 1.05em; font-weight: 600; }}
   .addbox form {{ display: flex; align-items: center; gap: 0.6em; flex-wrap: wrap; }}
-  .addbox select, .addbox input[type=text] {{ padding: 6px 8px; font-size: 14px; }}
-  .addbox input[type=text] {{ width: 260px; }}
-  .addbox button {{ padding: 6px 16px; font-size: 14px; cursor: pointer; }}
-  .flash {{ margin: 0.6em 0 0; padding: 0.5em 0.8em; border-radius: 4px; }}
-  .flash.ok {{ background: #d4edda; color: #155724; }}
-  .flash.error {{ background: #f8d7da; color: #721c24; }}
-  .pager {{ margin: 0.8em 0; font-size: 14px; }}
-  .pager a, .pager span.cur {{ padding: 3px 9px; margin: 0 2px; border: 1px solid #ccc; border-radius: 4px; text-decoration: none; color: #2b3a55; }}
-  .pager a:hover {{ background: #e8edf5; }}
-  .pager span.cur {{ background: #2b3a55; color: #fff; border-color: #2b3a55; }}
-  .pager span.disabled {{ color: #aaa; border-color: #eee; }}
-  .sep {{ color: #999; }}
-  a.del {{ color: #b00020; }}
-  textarea.plan {{ font-family: monospace; width: 100%; box-sizing: border-box; }}
-  a.cancel {{ text-decoration: none; color: #2b3a55; }}
-  button.danger {{ background: #b00020; color: #fff; border: none; padding: 6px 16px; cursor: pointer; }}
+  .addbox label {{ color: var(--muted); font-size: 13px; }}
+  .addbox select, .addbox input[type=text], .addbox input[type=number] {{
+    padding: 8px 10px; font-size: 14px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  }}
+  .addbox input[type=text] {{ width: 240px; }}
+  .addbox input:focus, .addbox select:focus {{ outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124, 140, 255, 0.2); }}
+  .addbox button {{ padding: 8px 18px; font-size: 14px; cursor: pointer; border: none; border-radius: 8px; font-weight: 600; }}
+  .addbox button[type=button] {{ background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }}
+  .addbox button[type=button]:hover {{ border-color: var(--accent); color: var(--accent); }}
+  .addbox button[type=submit] {{ background: var(--accent-2); color: #fff; }}
+  .addbox button[type=submit]:hover {{ background: var(--accent); }}
+  .flash {{ margin: 0.6em 0 0; padding: 0.6em 1em; border-radius: 8px; font-size: 14px; }}
+  .flash.ok {{ background: var(--ok-bg); color: var(--ok-fg); border: 1px solid #1d5c39; }}
+  .flash.error {{ background: var(--err-bg); color: var(--err-fg); border: 1px solid #6b2737; }}
+  .pager {{ margin: 1em 0; font-size: 14px; }}
+  .pager a, .pager span.cur {{
+    padding: 4px 11px; margin: 0 2px; border: 1px solid var(--border); border-radius: 8px;
+    text-decoration: none; color: var(--text); display: inline-block;
+  }}
+  .pager a:hover {{ border-color: var(--accent); color: var(--accent); }}
+  .pager span.cur {{ background: var(--accent-2); color: #fff; border-color: var(--accent-2); }}
+  .pager span.disabled {{ color: var(--muted); border-color: var(--border); }}
+  .sep {{ color: var(--muted); }}
+  a.del {{ color: #ff8fa3; }}
+  textarea.plan {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; width: 100%; box-sizing: border-box; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }}
+  a.cancel {{ text-decoration: none; color: var(--accent); }}
+  button.danger {{ background: #e05268; color: #fff; border: none; padding: 8px 18px; border-radius: 8px; cursor: pointer; font-weight: 600; }}
 </style>
 </head>
 <body>
@@ -440,15 +487,28 @@ PAGE_SHELL = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Astro Capture Report</title>
 <style>
-  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 2em; }
-  .flash { margin: 0.6em 0; padding: 0.5em 0.8em; border-radius: 4px; }
-  .flash.ok { background: #d4edda; color: #155724; }
-  .flash.error { background: #f8d7da; color: #721c24; }
-  .sep { color: #999; }
-  a.del { color: #b00020; }
-  textarea.plan { font-family: monospace; width: 100%; box-sizing: border-box; }
-  a.cancel { text-decoration: none; color: #2b3a55; }
-  button.danger { background: #b00020; color: #fff; border: none; padding: 6px 16px; cursor: pointer; }
+  :root {
+    --bg: #0b1020; --panel: #131a2e; --panel-2: #1a2340; --border: #26314f;
+    --text: #e6ebf5; --muted: #8b96b3; --accent: #7c8cff; --accent-2: #5a6cf0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: Inter, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    margin: 0; padding: 2em;
+    background: radial-gradient(1200px 600px at 80% -10%, #1b2547 0%, var(--bg) 55%) fixed, var(--bg);
+    color: var(--text);
+  }
+  h1 { font-size: 1.6em; font-weight: 700; margin: 0 0 0.5em; }
+  .meta { color: var(--muted); font-size: 14px; }
+  .flash { margin: 0.6em 0; padding: 0.6em 1em; border-radius: 8px; font-size: 14px; }
+  .flash.ok { background: #10331f; color: #6ee7a0; border: 1px solid #1d5c39; }
+  .flash.error { background: #3a1520; color: #ff9db1; border: 1px solid #6b2737; }
+  .sep { color: var(--muted); }
+  a { color: var(--accent); }
+  a.del { color: #ff8fa3; }
+  a.cancel { text-decoration: none; color: var(--accent); }
+  textarea.plan { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; width: 100%; box-sizing: border-box; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+  button.danger { background: #e05268; color: #fff; border: none; padding: 8px 18px; border-radius: 8px; cursor: pointer; font-weight: 600; }
 </style>
 </head>
 <body>
