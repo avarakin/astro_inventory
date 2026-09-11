@@ -83,6 +83,8 @@ def _total_seconds(rec):
 
 # key -> (display name, sortable, sort_value_fn, default_dir)
 COLUMNS = [
+    ("project", "Project",               True,  lambda r: 1 if r["has_project"] else 0, "asc"),
+    ("final",   "Final image",           True,  lambda r: 1 if r["has_final"] else 0, "asc"),
     ("latest",  "Latest image",          True,  lambda r: (r["latest"].timestamp() if r["latest"] else 0), "desc"),
     ("telescope", "Telescope",           True,  lambda r: r["telescope"], "asc"),
     ("object",  "Object",                True,  lambda r: r["object"], "asc"),
@@ -90,8 +92,6 @@ COLUMNS = [
     ("total",   "Total exposure",        True,  _total_seconds, "desc"),
     ("size",    "Size (MB)",             True,  lambda r: rec_size_mb(r), "desc"),
     ("filters", "Filters (count / duration / total)", False, None, None),
-    ("project", "Project",               True,  lambda r: 1 if r["has_project"] else 0, "asc"),
-    ("final",   "Final image",           True,  lambda r: 1 if r["has_final"] else 0, "asc"),
     ("masters", "Master images",         False, None, None),
     ("plan",    "Plan",                  False, None, None),
     ("actions", "Actions",               False, None, None),
@@ -209,14 +209,18 @@ def edit_plan(telescope, name):
 <h1>Edit plan: {html.escape(telescope)}/{html.escape(name)}</h1>
 <p class="meta">{html.escape(plan_path)}</p>
 <form method="post" action="{url_for('edit_plan', telescope=telescope, name=name)}">
-  <textarea name="plan" rows="24" cols="100" spellcheck="false">{html.escape(content)}</textarea>
+  <textarea name="plan" class="plan" rows="24" cols="100" spellcheck="false">{html.escape(content)}</textarea>
   <p>
     <button type="submit">Save</button>
     <a href="{url_for('index')}" class="cancel">Cancel</a>
   </p>
 </form>
 """
-    return PAGE_SHELL + body
+    flashes = "".join(
+        f'<div class="flash {html.escape(cat)}">{html.escape(msg)}</div>'
+        for cat, msg in get_flashed_messages(with_categories=True)
+    )
+    return PAGE_SHELL.format(flashes=flashes) + body
 
 
 @app.route("/delete/<telescope>/<name>", methods=["POST"])
@@ -429,7 +433,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .pager span.disabled {{ color: var(--muted); border-color: var(--border); }}
   .sep {{ color: var(--muted); }}
   a.del {{ color: #ff8fa3; }}
-  textarea.plan {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; width: 100%; box-sizing: border-box; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }}
+  textarea.plan {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; width: 100%; box-sizing: border-box; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }}
   a.cancel {{ text-decoration: none; color: var(--accent); }}
   button.danger {{ background: #e05268; color: #fff; border: none; padding: 8px 18px; border-radius: 8px; cursor: pointer; font-weight: 600; }}
 </style>
@@ -512,31 +516,96 @@ PAGE_SHELL = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Astro Imaging Tracker</title>
 <style>
-  :root {
-    --bg: #0b1020; --panel: #131a2e; --panel-2: #1a2340; --border: #26314f;
-    --text: #e6ebf5; --muted: #8b96b3; --accent: #7c8cff; --accent-2: #5a6cf0;
-  }
-  * { box-sizing: border-box; }
-  body {
+
+  :root {{
+    --bg: #0b1020;
+    --panel: #131a2e;
+    --panel-2: #1a2340;
+    --border: #26314f;
+    --text: #e6ebf5;
+    --muted: #8b96b3;
+    --accent: #7c8cff;
+    --accent-2: #5a6cf0;
+    --ok-bg: #10331f; --ok-fg: #6ee7a0;
+    --err-bg: #3a1520; --err-fg: #ff9db1;
+    --warn-bg: #3a2f10; --warn-fg: #ffd97a;
+    --red-bg: rgba(255, 99, 132, 0.12);
+    --yellow-bg: rgba(255, 209, 102, 0.10);
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
     font-family: Inter, -apple-system, 'Segoe UI', Roboto, sans-serif;
     margin: 0; padding: 2em;
     background: radial-gradient(1200px 600px at 80% -10%, #1b2547 0%, var(--bg) 55%) fixed, var(--bg);
     color: var(--text);
-  }
-  h1 { font-size: 1.6em; font-weight: 700; margin: 0 0 0.5em; }
-  .meta { color: var(--muted); font-size: 14px; }
-  .flash { margin: 0.6em 0; padding: 0.6em 1em; border-radius: 8px; font-size: 14px; }
-  .flash.ok { background: #10331f; color: #6ee7a0; border: 1px solid #1d5c39; }
-  .flash.error { background: #3a1520; color: #ff9db1; border: 1px solid #6b2737; }
-  .sep { color: var(--muted); }
-  a { color: var(--accent); }
-  a.del { color: #ff8fa3; }
-  a.cancel { text-decoration: none; color: var(--accent); }
-  textarea.plan { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; width: 100%; box-sizing: border-box; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
-  button.danger { background: #e05268; color: #fff; border: none; padding: 8px 18px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+  }}
+  h1 {{ font-size: 1.6em; font-weight: 700; letter-spacing: 0.3px; margin: 0 0 0.5em; }}
+  a {{ color: var(--accent); }}
+  .meta {{ color: var(--muted); margin-bottom: 1.2em; font-size: 14px; }}
+  .meta a {{ text-decoration: none; }}
+  .meta a:hover {{ text-decoration: underline; }}
+  table {{ border-collapse: separate; border-spacing: 0; width: 100%; font-size: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }}
+  th, td {{ padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }}
+  th {{
+    background: var(--panel-2); color: var(--text);
+    position: sticky; top: 0; user-select: none; font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600;
+  }}
+  th a {{ color: var(--text); text-decoration: none; }}
+  th a:hover {{ color: var(--accent); }}
+  th .arrow {{ display: inline-block; font-size: 15px; font-weight: bold; margin-left: 6px; vertical-align: middle; color: var(--accent); }}
+  tbody tr {{ background: transparent; transition: background 0.12s; }}
+  tbody tr:hover {{ background: rgba(124, 140, 255, 0.07); }}
+  tr.red {{ background: var(--red-bg) !important; }}
+  tr.yellow {{ background: var(--yellow-bg) !important; }}
+  .thumbs img {{ max-height: 60px; max-width: 120px; margin: 2px; border: 1px solid var(--border); border-radius: 4px; vertical-align: middle; }}
+  .plan {{ font-size: 12px; }}
+  .plan-top {{ margin-bottom: 4px; }}
+  .badge {{ display: inline-block; background: var(--accent-2); color: #fff; border-radius: 10px; padding: 2px 9px; font-size: 11px; font-weight: 600; margin-right: 6px; }}
+  .plan-link {{ display: inline-block; padding: 2px 10px; background: var(--accent-2); color: #fff; border-radius: 10px; text-decoration: none; font-size: 11px; font-weight: 600; }}
+  .plan-link:hover {{ background: var(--accent); }}
+  .plan-body {{ margin: 2px 0; line-height: 1.4; }}
+  .plan-meta {{ color: var(--muted); font-size: 11px; margin-top: 3px; }}
+  .btn {{ padding: 6px 14px; font-size: 13px; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }}
+  .btn-edit {{ background: var(--accent-2); color: #fff; }}
+  .btn-edit:hover {{ background: var(--accent); }}
+  .btn-del {{ background: #e05268; color: #fff; }}
+  .btn-del:hover {{ background: #f06a7d; }}
+  .addbox {{ border: 1px solid var(--border); border-radius: 12px; padding: 1.2em 1.4em; margin-bottom: 1.5em; background: var(--panel); }}
+  .addbox h2 {{ margin: 0 0 0.9em; font-size: 1.05em; font-weight: 600; }}
+  .addbox form {{ display: flex; align-items: center; gap: 0.6em; flex-wrap: wrap; }}
+  .addbox label {{ color: var(--muted); font-size: 13px; }}
+  .addbox select, .addbox input[type=text], .addbox input[type=number] {{
+    padding: 8px 10px; font-size: 14px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  }}
+  .addbox input[type=text] {{ width: 240px; }}
+  .addbox input:focus, .addbox select:focus {{ outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124, 140, 255, 0.2); }}
+  .addbox button {{ padding: 8px 18px; font-size: 14px; cursor: pointer; border: none; border-radius: 8px; font-weight: 600; }}
+  .addbox button[type=button] {{ background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }}
+  .addbox button[type=button]:hover {{ border-color: var(--accent); color: var(--accent); }}
+  .addbox button[type=submit] {{ background: var(--accent-2); color: #fff; }}
+  .addbox button[type=submit]:hover {{ background: var(--accent); }}
+  .flash {{ margin: 0.6em 0 0; padding: 0.6em 1em; border-radius: 8px; font-size: 14px; }}
+  .flash.ok {{ background: var(--ok-bg); color: var(--ok-fg); border: 1px solid #1d5c39; }}
+  .flash.error {{ background: var(--err-bg); color: var(--err-fg); border: 1px solid #6b2737; }}
+  .pager {{ margin: 1em 0; font-size: 14px; }}
+  .pager a, .pager span.cur {{
+    padding: 4px 11px; margin: 0 2px; border: 1px solid var(--border); border-radius: 8px;
+    text-decoration: none; color: var(--text); display: inline-block;
+  }}
+  .pager a:hover {{ border-color: var(--accent); color: var(--accent); }}
+  .pager span.cur {{ background: var(--accent-2); color: #fff; border-color: var(--accent-2); }}
+  .pager span.disabled {{ color: var(--muted); border-color: var(--border); }}
+  .sep {{ color: var(--muted); }}
+  a.del {{ color: #ff8fa3; }}
+  textarea.plan {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; width: 100%; box-sizing: border-box; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }}
+  a.cancel {{ text-decoration: none; color: var(--accent); }}
+  button.danger {{ background: #e05268; color: #fff; border: none; padding: 8px 18px; border-radius: 8px; cursor: pointer; font-weight: 600; }}
+
 </style>
 </head>
 <body>
+{flashes}
 """
 
 

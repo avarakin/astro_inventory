@@ -505,14 +505,14 @@ Click a column header to sort (click again to reverse). Default: Latest image, d
 <table id="report">
 <thead>
 <tr>
+  <th data-type="bool">Project<span class="arrow"></span></th>
+  <th data-type="bool">Final image<span class="arrow"></span></th>
   <th data-type="ts">Latest image<span class="arrow"></span></th>
   <th data-type="str">Telescope<span class="arrow"></span></th>
   <th data-type="str">Object<span class="arrow"></span></th>
   <th data-type="num">Total exposure<span class="arrow"></span></th>
   <th data-type="num">Size (MB)<span class="arrow"></span></th>
   <th data-type="str">Filters (count / duration / total)<span class="arrow"></span></th>
-  <th data-type="bool">Project<span class="arrow"></span></th>
-  <th data-type="bool">Final image<span class="arrow"></span></th>
   <th data-type="str">Master images<span class="arrow"></span></th>
   <th data-type="str">Plan<span class="arrow"></span></th>
   <th data-type="str">Actions<span class="arrow"></span></th>
@@ -671,7 +671,9 @@ def build_rows(records, image_url=None, actions_url=None):
             cls = "yellow"
 
         def yn(v):
-            return ("1", "Yes") if v else ("0", "No")
+            if v:
+                return ("1", '<span style="color:#4caf50;font-weight:bold">✔</span>')
+            return ("0", '<span style="color:#f44336;font-weight:bold">✘</span>')
 
         p_sort, p_disp = yn(rec["has_project"])
         f_sort, f_disp = yn(rec["has_final"])
@@ -707,6 +709,8 @@ def build_rows(records, image_url=None, actions_url=None):
 
         rows.append(
             f'<tr class="{cls}">'
+            f'<td data-sort="{p_sort}">{p_disp}</td>'
+            f'<td data-sort="{f_sort}">{f_disp}</td>'
             f'<td data-sort="{ts_sort}">{html.escape(ts_disp)}</td>'
             f'<td data-sort="{html.escape(rec["telescope"])}">{html.escape(rec["telescope"])}</td>'
             f'<td data-sort="{html.escape(rec["object"])}">{html.escape(rec["object"])}</td>'
@@ -714,8 +718,6 @@ def build_rows(records, image_url=None, actions_url=None):
             f'<td data-sort="{total_sec}">{fmt_total(total_sec)}</td>'
             f'<td data-sort="{size_mb:.6f}">{size_mb:.1f}</td>'
             f'<td data-sort="">{filters_html}</td>'
-            f'<td data-sort="{p_sort}">{p_disp}</td>'
-            f'<td data-sort="{f_sort}">{f_disp}</td>'
             f'<td data-sort="">{thumbs_html}</td>'
             f'<td data-sort="">{plan_html}</td>'
             f'<td data-sort="">{actions_html}</td>'
