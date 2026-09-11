@@ -166,7 +166,7 @@ def edit_plan(telescope, name):
     obj_dir, err = _resolve_object(telescope, name)
     if err:
         flash(err, "error")
-        return redirect(url_for("index"))
+        return redirect(_index_return_url())
     plan_path = os.path.join(obj_dir, "plan.md")
 
     if request.method == "POST":
@@ -176,10 +176,10 @@ def edit_plan(telescope, name):
                 f.write(content)
         except OSError as e:
             flash(f"Failed to save plan: {e}", "error")
-            return redirect(url_for("index"))
+            return redirect(_index_return_url())
         flash(f"Saved {telescope}/{name}/plan.md", "ok")
         get_records(force=True)
-        return redirect(url_for("index"))
+        return redirect(_index_return_url())
 
     try:
         with open(plan_path, "r", encoding="utf-8") as f:
@@ -206,15 +206,15 @@ def delete_object(telescope, name):
     obj_dir, err = _resolve_object(telescope, name)
     if err:
         flash(err, "error")
-        return redirect(url_for("index"))
+        return redirect(_index_return_url())
     try:
         shutil.rmtree(obj_dir)
     except OSError as e:
         flash(f"Failed to delete {obj_dir}: {e}", "error")
-        return redirect(url_for("index"))
+        return redirect(_index_return_url())
     flash(f"Deleted {telescope}/{name}", "ok")
     get_records(force=True)
-    return redirect(url_for("index"))
+    return redirect(_index_return_url())
 
 
 @app.route("/astrobin/<slug>")
@@ -276,22 +276,22 @@ def add_object():
 
     if not telescope or not name:
         flash("Please choose a telescope and enter an object name.", "error")
-        return redirect(url_for("index"))
+        return redirect(_index_return_url())
 
     # only allow telescope names that actually exist in ROOT
     if not os.path.isdir(os.path.join(astro_inventory.ROOT, telescope)):
         flash(f"Telescope directory not found: {telescope}", "error")
-        return redirect(url_for("index"))
+        return redirect(_index_return_url())
 
     # reject anything that is not a plain directory name
     if re.search(r"[\x00/\\]", name) or name in ("", ".", ".."):
         flash("Invalid object name.", "error")
-        return redirect(url_for("index"))
+        return redirect(_index_return_url())
 
     obj_dir = os.path.join(astro_inventory.ROOT, telescope, name)
     if os.path.exists(obj_dir):
         flash(f"Object directory already exists: {telescope}/{name}", "error")
-        return redirect(url_for("index"))
+        return redirect(_index_return_url())
 
     plan_path = os.path.join(obj_dir, "plan.md")
     try:
@@ -315,11 +315,11 @@ def add_object():
             f.write(f"# {name}\n\n## Plan\n")
     except OSError as e:
         flash(f"Failed to create {obj_dir}: {e}", "error")
-        return redirect(url_for("index"))
+        return redirect(_index_return_url())
 
     flash(f"Created {telescope}/{name}/plan.md", "ok")
     get_records(force=True)  # pick it up immediately
-    return redirect(url_for("index"))
+    return redirect(_index_return_url())
 
 
 # --- page rendering ----------------------------------------------------------
@@ -520,6 +520,20 @@ PAGE_SHELL = """<!DOCTYPE html>
 </head>
 <body>
 """
+
+
+def _index_return_url():
+    """Return to the index with the user's current view params (sort/dir/page/page_size) preserved."""
+    ref = request.referrer or ""
+    if ref.startswith(request.host_url):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(ref)
+            if p.path == "/":
+                return "?" + p.query
+        except Exception:
+            pass
+    return "?"
 
 
 def _pager_url(page, sort_key, direction, page_size):
