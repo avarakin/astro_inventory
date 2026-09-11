@@ -2,7 +2,8 @@
 """
 Astronomy image inventory — Flask server.
 
-Serves the report with server-side sorting and pagination (20 rows/page),
+Serves the report with server-side sorting and pagination (page size configurable,
+default 20 rows/page; 0 disables paging),
 plus an "Add a new object" section that creates
 /data/Astro/CCD/<telescope>/<object>/plan.md.
 
@@ -37,7 +38,7 @@ def add_no_cache_headers(response):
     response.headers["Expires"] = "0"
     return response
 
-PAGE_SIZE = 20
+PAGE_SIZE = 20  # overridden by --page-size / ?page_size=N (0 disables paging)
 
 # --- scan cache --------------------------------------------------------------
 
@@ -110,16 +111,22 @@ def index():
     records = sort_records(records, sort_key, direction)
 
     # --- pagination ---
+    page_size = request.args.get("page_size", type=int, default=PAGE_SIZE)
+    if page_size is None or page_size < 0:
+        page_size = PAGE_SIZE
     total = len(records)
-    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = request.args.get("page", type=int) or 1
-    page = max(1, min(page, pages))
-    start = (page - 1) * PAGE_SIZE
-    page_records = records[start:start + PAGE_SIZE]
+    if page_size == 0:  # paging disabled
+        page, pages, page_records = 1, 1, records
+    else:
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = request.args.get("page", type=int) or 1
+        page = max(1, min(page, pages))
+        start = (page - 1) * page_size
+        page_records = records[start:start + page_size]
 
     return render_page(
         page_records, generated, telescopes,
-        total=total, page=page, pages=pages,
+        total=total, page=page, pages=pages, page_size=page_size,
         sort_key=sort_key, direction=direction,
     )
 
@@ -515,15 +522,17 @@ PAGE_SHELL = """<!DOCTYPE html>
 """
 
 
-def _pager_url(page, sort_key, direction):
-    params = {"sort": sort_key, "dir": direction, "page": page}
+def _pager_url(page, sort_key, direction, page_size):
+    params = {"sort": sort_key, "dir": direction, "page": page, "page_size": page_size}
     return "?" + urlencode(params)
 
 
-def render_pager(page, pages, total, sort_key, direction):
+def render_pager(page, pages, total, sort_key, direction, page_size):
+    if page_size == 0:
+        return f"<span>{total} objects (paging disabled)</span>"
     parts = []
     if page > 1:
-        parts.append(f'<a href="{_pager_url(page - 1, sort_key, direction)}">&laquo; Prev</a>')
+        parts.append(f'<a href="{_pager_url(page - 1, sort_key, direction, page_size)}">&laquo; Prev</a>')
     else:
         parts.append('<span class="disabled">&laquo; Prev</span>')
 
@@ -537,18 +546,18 @@ def render_pager(page, pages, total, sort_key, direction):
         if n == page:
             parts.append(f'<span class="cur">{n}</span>')
         else:
-            parts.append(f'<a href="{_pager_url(n, sort_key, direction)}">{n}</a>')
+            parts.append(f'<a href="{_pager_url(n, sort_key, direction, page_size)}">{n}</a>')
         prev = n
 
     if page < pages:
-        parts.append(f'<a href="{_pager_url(page + 1, sort_key, direction)}">Next &raquo;</a>')
+        parts.append(f'<a href="{_pager_url(page + 1, sort_key, direction, page_size)}">Next &raquo;</a>')
     else:
         parts.append('<span class="disabled">Next &raquo;</span>')
     parts.append(f"<span>Page {page} of {pages} &mdash; {total} objects</span>")
     return " ".join(parts)
 
 
-def render_page(page_records, generated, telescopes, total, page, pages, sort_key, direction):
+def render_page(page_records, generated, telescopes, total, page, pages, page_size, sort_key, direction):
     options = "\n".join(
         f'<option value="{html.escape(t)}">{html.escape(t)}</option>' for t in telescopes
     )
@@ -578,16 +587,16 @@ def render_page(page_records, generated, telescopes, total, page, pages, sort_ke
                 arrow = "&#8597;"
             other_dir = "desc" if direction == "asc" else "asc"
             if key == sort_key:
-                url = _pager_url(1, key, other_dir)
+                url = _pager_url(1, key, other_dir, page_size)
             else:
-                url = _pager_url(1, key, COL_BY_KEY[key][4])
+                url = _pager_url(1, key, COL_BY_KEY[key][4], page_size)
             header_cells.append(
                 f'<th><a href="{url}">{html.escape(name)}<span class="arrow">{arrow}</span></a></th>'
             )
         else:
             header_cells.append(f'<th>{html.escape(name)}</th>')
 
-    pager = render_pager(page, pages, total, sort_key, direction)
+    pager = render_pager(page, pages, total, sort_key, direction, page_size)
 
     return PAGE_TEMPLATE.format(
         root=html.escape(astro_inventory.ROOT),
@@ -595,7 +604,7 @@ def render_page(page_records, generated, telescopes, total, page, pages, sort_ke
         gen=generated.strftime("%Y-%m-%d %H:%M:%S"),
         telescope_options=options,
         flashes=flashes,
-        refresh_url=_pager_url(1, sort_key, direction) + "&refresh=1",
+        refresh_url=_pager_url(1, sort_key, direction, page_size) + "&refresh=1",
         header_cells="\n".join(header_cells),
         rows=build_rows(page_records, image_url=image_url, actions_url=actions_url),
         pager=pager,
@@ -605,6 +614,10 @@ def render_page(page_records, generated, telescopes, total, page, pages, sort_ke
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Astronomy image inventory server")
     parser.add_argument("--root", required=True, help="Root directory for CCD data")
+    parser.add_argument("--page-size", type=int, default=20,
+                        help="Rows per page; 0 disables paging (default: 20)")
     args = parser.parse_args()
+    if args.page_size >= 0:
+        PAGE_SIZE = args.page_size
     astro_inventory.ROOT = args.root
     app.run(host="0.0.0.0", port=5000, debug=False)
