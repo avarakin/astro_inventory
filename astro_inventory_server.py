@@ -43,15 +43,33 @@ PAGE_SIZE = 20  # overridden by --page-size / ?page_size=N (0 disables paging)
 # --- scan cache --------------------------------------------------------------
 
 _cache_lock = threading.Lock()
-_cache = {"records": None, "generated": None}
+_cache = {"records": None, "generated": None, "root_mtime": 0}
+
+
+def _root_mtime():
+    """Return the max mtime of top-level entries under ROOT (cheap staleness check)."""
+    try:
+        entries = os.listdir(astro_inventory.ROOT)
+    except OSError:
+        return 0
+    mtimes = []
+    for e in entries:
+        p = os.path.join(astro_inventory.ROOT, e)
+        try:
+            mtimes.append(os.stat(p).st_mtime)
+        except OSError:
+            pass
+    return max(mtimes) if mtimes else 0
 
 
 def get_records(force=False):
     with _cache_lock:
-        if force or _cache["records"] is None:
+        stale = _cache["records"] is not None and _root_mtime() != _cache["root_mtime"]
+        if force or _cache["records"] is None or stale:
             records = traverse(astro_inventory.ROOT)
             _cache["records"] = records
             _cache["generated"] = datetime.now()
+            _cache["root_mtime"] = _root_mtime()
     return _cache["records"], _cache["generated"]
 
 
