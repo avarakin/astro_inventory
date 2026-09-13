@@ -6,3 +6,8 @@ __pycache__/
 .location
 GeoLite2-City.mmdb
 server.log
+
+
+# Added by cargo
+
+/target
