@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 
@@ -74,22 +75,26 @@ pub struct ObjectRecord {
 // --- Filename parsing --------------------------------------------------------
 
 /// Parse exposure duration from filename. Returns seconds or None.
-pub fn parse_duration(name: &str) -> Option<f64> {
-    let re_s = regex::Regex::new(r"_(\d+(?:\.\d+)?)s_").unwrap();
-    let re_secs = regex::Regex::new("(?i)_(\\d+(?:\\.\\d+)?)_secs_").unwrap();
-    let re_exposure = regex::Regex::new("(?i)EXPOSURE-(\\d+(?:\\.\\d+)?)s").unwrap();
+static RE_DUR_S: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"_(\d+(?:\.\d+)?)s_").unwrap());
+static RE_DUR_SECS: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new("(?i)_(\\d+(?:\\.\\d+)?)_secs_").unwrap());
+static RE_DUR_EXPOSURE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new("(?i)EXPOSURE-(\\d+(?:\\.\\d+)?)s").unwrap());
 
-    if let Some(m) = re_s.captures(name) {
+pub fn parse_duration(name: &str) -> Option<f64> {
+
+    if let Some(m) = RE_DUR_S.captures(name) {
         if let Some(g) = m.get(1) {
             return g.as_str().parse::<f64>().ok();
         }
     }
-    if let Some(m) = re_secs.captures(name) {
+    if let Some(m) = RE_DUR_SECS.captures(name) {
         if let Some(g) = m.get(1) {
             return g.as_str().parse::<f64>().ok();
         }
     }
-    if let Some(m) = re_exposure.captures(name) {
+    if let Some(m) = RE_DUR_EXPOSURE.captures(name) {
         if let Some(g) = m.get(1) {
             return g.as_str().parse::<f64>().ok();
         }
@@ -98,20 +103,25 @@ pub fn parse_duration(name: &str) -> Option<f64> {
 }
 
 /// Parse filter letter from filename. Returns the letter or None (DSLR).
+static RE_FILTER: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"_([LRBGSOH])_").unwrap());
+
 pub fn parse_filter(name: &str) -> Option<String> {
-    let re = regex::Regex::new(r"_([LRBGSOH])_").unwrap();
-    re.captures(name)
+    RE_FILTER.captures(name)
         .and_then(|m| m.get(1))
         .map(|m| m.as_str().to_string())
 }
 
 /// Parse timestamp from filename. Returns local naive datetime or None.
+static RE_TS_ISO: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(\d{4}-\d{2}-\d{2})[T_ ](\d{2})[._-](\d{2})[._-](\d{2})").unwrap()
+});
+static RE_TS_COMPACT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})").unwrap()
+});
+
 pub fn parse_timestamp(name: &str) -> Option<DateTime<Local>> {
-    let re_iso = regex::Regex::new(
-        r"(\d{4}-\d{2}-\d{2})[T_ ](\d{2})[._-](\d{2})[._-](\d{2})",
-    )
-    .unwrap();
-    if let Some(m) = re_iso.captures(name) {
+    if let Some(m) = RE_TS_ISO.captures(name) {
         let date_str = format!(
             "{} {}:{}:{}",
             m.get(1).unwrap().as_str(),
@@ -128,8 +138,7 @@ pub fn parse_timestamp(name: &str) -> Option<DateTime<Local>> {
         }
     }
 
-    let re_compact = regex::Regex::new(r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})").unwrap();
-    if let Some(m) = re_compact.captures(name) {
+    if let Some(m) = RE_TS_COMPACT.captures(name) {
         let date_str: String = (1..=6)
             .map(|i| m.get(i).unwrap().as_str().to_string())
             .collect();
@@ -144,18 +153,19 @@ pub fn parse_timestamp(name: &str) -> Option<DateTime<Local>> {
 }
 
 /// Parse RA from plan.md text. Returns hours (f64) or None.
+static RE_RA_YAML: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^ra:\s*(\d+)h(\d+)m(\d+)s").unwrap());
+static RE_RA_OLD: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\*\*RA:\*\*\s*(\d+)h(\d+)m(\d+)s").unwrap());
+
 pub fn parse_ra_hours(text: &str) -> Option<f64> {
     if text.is_empty() {
         return None;
     }
     // YAML frontmatter: ra: 23h20m29s
-    let re_yaml = regex::Regex::new(r"(?m)^ra:\s*(\d+)h(\d+)m(\d+)s").unwrap();
-    let m = re_yaml
+    let m = RE_RA_YAML
         .captures(text)
-        .or_else(|| {
-            let re_old = regex::Regex::new(r"\*\*RA:\*\*\s*(\d+)h(\d+)m(\d+)s").unwrap();
-            re_old.captures(text)
-        })?;
+        .or_else(|| RE_RA_OLD.captures(text))?;
     let h = m.get(1).unwrap().as_str().parse::<f64>().ok()?;
     let mi = m.get(2).unwrap().as_str().parse::<f64>().ok()?;
     let s = m.get(3).unwrap().as_str().parse::<f64>().ok()?;
@@ -217,6 +227,8 @@ pub fn total_seconds(rec: &ObjectRecord) -> f64 {
 
 /// Traverse the root directory and build object records.
 pub fn traverse(root: &Path, longitude: f64) -> Vec<ObjectRecord> {
+    let _t0 = std::time::Instant::now();
+    eprintln!("[profile] traverse: start");
     let mut records = Vec::new();
 
     let root_entries = match std::fs::read_dir(root) {
@@ -272,6 +284,7 @@ pub fn traverse(root: &Path, longitude: f64) -> Vec<ObjectRecord> {
 
             // plan.md handling
             let plan_path = obj_path.join("plan.md");
+            let _tp = std::time::Instant::now();
             if plan_path.is_file() {
                 let plan_mtime = std::fs::metadata(&plan_path)
                     .and_then(|m| m.modified())
@@ -306,11 +319,15 @@ pub fn traverse(root: &Path, longitude: f64) -> Vec<ObjectRecord> {
             } else {
                 rec.plan = None;
             }
+            if _tp.elapsed().as_millis() > 50 {
+                eprintln!("[profile] plan.md block for {}/{obj_name}: {:?}", tel_name, _tp.elapsed());
+            }
 
             records.push(rec);
         }
     }
 
+    eprintln!("[profile] traverse: done in {:?} ({} records)", _t0.elapsed(), records.len());
     records
 }
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 /// Complete 88-constellation abbreviation map (from astro_inventory.py).
 const CONSTELLATIONS: &[(&str, &str)] = &[
@@ -146,9 +147,11 @@ pub fn html_escape(s: &str) -> String {
 }
 
 /// Wrap http(s) URLs in already-escaped text with target=_blank anchors.
+static RE_URL: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"https?://[^\s<>\x22']+").unwrap());
+
 pub fn linkify(escaped_text: &str) -> String {
-    let re = regex::Regex::new(r"https?://[^\s<>\x22']+").unwrap();
-    re.replace_all(escaped_text, |caps: &regex::Captures| {
+    RE_URL.replace_all(escaped_text, |caps: &regex::Captures| {
         format!(
             "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
             caps.get(0).unwrap().as_str(),
