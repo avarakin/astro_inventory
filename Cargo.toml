@@ -16,3 +16,7 @@ maxminddb = "0.31"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 percent-encoding = "2"
+
+[profile.prof]
+inherits = "release"
+debug = true

@@ -32,6 +32,14 @@ fn circ_diff(a: f64, b: f64) -> f64 {
 /// Find the upcoming date when an object transits at local civil midnight.
 /// Returns the local midnight datetime where LST is closest to RA_object.
 pub fn transit_date(ra_hours: f64, lon_deg: f64) -> Option<DateTime<Local>> {
+    #[allow(clippy::disallowed_names)]
+    let _t0 = std::time::Instant::now();
+    let result = transit_date_inner(ra_hours, lon_deg);
+    eprintln!("[profile] transit_date: {:?}", _t0.elapsed());
+    result
+}
+
+fn transit_date_inner(ra_hours: f64, lon_deg: f64) -> Option<DateTime<Local>> {
     let now = Local::now();
     let midnight_naive = now
         .naive_local()

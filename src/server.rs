@@ -71,7 +71,10 @@ impl AppState {
             .map_or(true, |_| self.root_mtime() != cache.root_mtime);
 
         if force || cache.records.is_none() || stale {
+            let t0 = std::time::Instant::now();
+            eprintln!("[profile] get_records: refresh (force={force}, stale={stale})");
             let records = traverse(&self.root, self.longitude);
+            eprintln!("[profile] get_records: traverse took {:?}", t0.elapsed());
             let generated = Local::now();
             cache.records = Some(records);
             cache.generated = Some(generated);
