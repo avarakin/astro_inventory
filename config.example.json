@@ -1,0 +1,7 @@
+{
+  "root": "/data/Astro/CCD",
+  "staging": "/ssd/sync",
+  "cache": "/home/alex/.cache/astro_inventory",
+  "page_size": 20,
+  "compendium_dir": "data/compendium"
+}

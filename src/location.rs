@@ -1,9 +1,12 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-/// Detect local longitude using GeoLite2 + public IP.
-/// Cached in .location file so we only hit the network once.
-pub fn detect_longitude() -> f64 {
+/// Detect observer (latitude, longitude) using GeoLite2 + public IP.
+/// Cached in `.location` (format: "lat lon") so we only hit the network once.
+///
+/// NOTE: uses `reqwest::blocking` — call it *before* starting the tokio
+/// runtime, or it panics ("Cannot drop a runtime in an async context").
+pub fn detect_location() -> (f64, f64) {
     let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let location_cache = base_dir.join(".location");
@@ -11,14 +14,16 @@ pub fn detect_longitude() -> f64 {
 
     // Try cache first
     if let Ok(val) = std::fs::read_to_string(&location_cache) {
-        let val = val.trim();
-        if let Ok(lon) = val.parse::<f64>() {
-            return lon;
+        let mut it = val.split_whitespace();
+        let lat = it.next().and_then(|s| s.parse::<f64>().ok());
+        let lon = it.next().and_then(|s| s.parse::<f64>().ok());
+        if let (Some(lat), Some(lon)) = (lat, lon) {
+            return (lat, lon);
         }
     }
 
     // Try GeoLite2
-    let result = (|| -> anyhow::Result<f64> {
+    let result = (|| -> anyhow::Result<(f64, f64)> {
         let ip_str = reqwest::blocking::get("https://api.ipify.org")
             .map_err(|e| anyhow::anyhow!("IP lookup failed: {e}"))?
             .text()
@@ -39,22 +44,26 @@ pub fn detect_longitude() -> f64 {
             .decode()
             .map_err(|e| anyhow::anyhow!("GeoIP decode failed: {e}"))?;
         let city = city.ok_or_else(|| anyhow::anyhow!("No GeoIP result"))?;
+        let lat = city
+            .location
+            .latitude
+            .ok_or_else(|| anyhow::anyhow!("No latitude in GeoIP result"))?;
         let lon = city
             .location
             .longitude
             .ok_or_else(|| anyhow::anyhow!("No longitude in GeoIP result"))?;
 
-        std::fs::write(&location_cache, lon.to_string())
+        std::fs::write(&location_cache, format!("{lat} {lon}"))
             .map_err(|e| anyhow::anyhow!("Cache write failed: {e}"))?;
 
-        Ok(lon)
+        Ok((lat, lon))
     })();
 
     match result {
-        Ok(lon) => lon,
+        Ok(v) => v,
         Err(e) => {
             eprintln!("WARNING: GeoIP lookup failed: {e}");
-            0.0
+            (0.0, 0.0)
         }
     }
 }

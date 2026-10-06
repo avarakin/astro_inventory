@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -9,20 +10,32 @@ use axum::routing::{get, post};
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use axum::{extract::Form, Router};
 use chrono::Local;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use crate::plan::expand_constellation;
 use crate::render::{
     col_by_key, page_size_control, render_edit_page, render_header_cells, render_index_page,
-    render_pager, sort_records,
+    render_pager, render_staging_index, render_staging_review, sort_records,
 };
 use crate::traverse::{build_row, traverse, ObjectRecord};
+use crate::staging::{self, Manifest, PreviewCache};
+use astro_inventory::compendium;
 
 /// Shared application state.
 pub struct AppState {
     pub root: PathBuf,
     pub page_size_default: usize,
     pub longitude: f64,
+    pub latitude: f64,
+    pub compendium_dir: PathBuf,
     cache: Mutex<ScanCache>,
+    /// `None` disables the whole staging review feature.
+    pub staging_root: Option<PathBuf>,
+    previews: Option<PreviewCache>,
+    /// Parsed manifests keyed by canonical staging directory.
+    manifests: Mutex<HashMap<String, Manifest>>,
+    /// Serializes full FITS decodes: each one saturates rayon for ~250 ms.
+    render_permits: Semaphore,
 }
 
 struct ScanCache {
@@ -32,17 +45,102 @@ struct ScanCache {
 }
 
 impl AppState {
-    pub fn new(root: PathBuf, page_size: usize, longitude: f64) -> Arc<Self> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        root: PathBuf,
+        page_size: usize,
+        longitude: f64,
+        latitude: f64,
+        compendium_dir: PathBuf,
+        staging_root: Option<PathBuf>,
+        cache_dir: PathBuf,
+    ) -> Arc<Self> {
+        let previews = staging_root
+            .as_ref()
+            .map(|_| PreviewCache::new(cache_dir));
         Arc::new(Self {
             root,
             page_size_default: page_size,
             longitude,
+            latitude,
+            compendium_dir,
             cache: Mutex::new(ScanCache {
                 records: None,
                 generated: None,
                 root_mtime: 0.0,
             }),
+            staging_root,
+            previews,
+            manifests: Mutex::new(HashMap::new()),
+            render_permits: Semaphore::new(1),
         })
+    }
+
+    /// Resolve a client-supplied path, refusing anything outside the staging
+    /// root. Every staging route goes through this first.
+    fn staging_path(&self, raw: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+        let sr = self
+            .staging_root
+            .as_ref()
+            .ok_or((StatusCode::NOT_FOUND, "staging review is not enabled".to_string()))?;
+        staging::resolve_within(sr, raw).map_err(|e| (StatusCode::BAD_REQUEST, e))
+    }
+
+    /// Resolve a client-supplied path that must stay inside the CCD root.
+    fn ccd_path(&self, raw: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+        staging::resolve_within(&self.root, raw).map_err(|e| (StatusCode::BAD_REQUEST, e))
+    }
+
+    /// Return a manifest for `dir`, rescanning only when the file set changed.
+    fn manifest_for(&self, dir: &std::path::Path) -> Manifest {
+        let key = dir.to_string_lossy().to_string();
+        let sig = staging::dir_signature(dir, &staging::list_images(dir));
+        {
+            let cache = self.manifests.lock().unwrap();
+            if let Some(m) = cache.get(&key) {
+                if m.signature == sig {
+                    return m.clone();
+                }
+            }
+        }
+        let m = staging::scan(dir);
+        self.manifests.lock().unwrap().insert(key, m.clone());
+        m
+    }
+
+    /// Drop the manifest entries and cached JPEGs of files that were pushed or
+    /// deleted, so the next view cannot show a vanished frame.
+    /// Collect the preview cache keys for `processed` paths **before** anything
+    /// is mutated. A key folds in `mtime + size`, and once a file has been
+    /// moved its stat is gone, so this must run first.
+    fn snapshot_keys(&self, dir: &str, processed: &[String]) -> Vec<u64> {
+        let cache = self.manifests.lock().unwrap();
+        let Some(m) = cache.get(dir) else { return Vec::new() };
+        m.groups
+            .iter()
+            .flat_map(|g| g.frames.iter())
+            .filter(|f| processed.iter().any(|p| p == &f.path))
+            .map(|f| f.key)
+            .collect()
+    }
+
+    /// Drop processed frames from the cached manifest so a re-open reflects the
+    /// directory as it now is, without paying for a full rescan. When the
+    /// directory is drained the whole entry goes away.
+    fn drop_frames_from_manifest(&self, dir: &str, processed: &[String]) {
+        {
+            let mut cache = self.manifests.lock().unwrap();
+            if let Some(m) = cache.get_mut(dir) {
+                for g in m.groups.iter_mut() {
+                    g.frames.retain(|f| !processed.iter().any(|p| p == &f.path));
+                }
+                m.groups.retain(|g| !g.frames.is_empty());
+                m.scanned = m.groups.iter().map(|g| g.frames.len()).sum();
+                if m.scanned == 0 {
+                    cache.remove(dir);
+                }
+            }
+        }
     }
 
     fn root_mtime(&self) -> f64 {
@@ -96,6 +194,17 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/edit/{telescope}/{name}", get(edit_plan_get).post(edit_plan_post))
         .route("/delete/{telescope}/{name}", post(delete_object))
         .route("/astrobin/{slug}", get(astrobin_lookup))
+        .route("/compendium", get(compendium_page))
+        .route("/compendium/data", get(compendium_data))
+        .route("/compendium/thumb/{id}", get(compendium_thumb))
+        .route("/staging", get(staging_index))
+        .route("/staging/review", get(staging_review))
+        .route("/staging/manifest", get(staging_manifest))
+        .route("/staging/preview", get(staging_preview))
+        .route("/staging/destinations", get(staging_destinations))
+        .route("/staging/destfiles", get(staging_destfiles))
+        .route("/staging/newdest", post(staging_newdest))
+        .route("/staging/apply", post(staging_apply))
         .with_state(state)
 }
 
@@ -211,6 +320,7 @@ async fn index(
 
     let html = render_index_page(
         &state.root.to_string_lossy(),
+        &format!("{:.2}, {:.2}", state.latitude, state.longitude),
         total,
         &generated_str,
         &telescope_options,
@@ -219,6 +329,11 @@ async fn index(
         &header_cells,
         &rows.join("\n"),
         &pager,
+        if state.staging_root.is_some() {
+            " &middot; <a href=\"/staging\">Review staging</a>"
+        } else {
+            ""
+        },
     );
 
     Html(html).into_response()
@@ -283,6 +398,104 @@ struct AddForm {
     sample: Option<String>,
 }
 
+/// Optional `plan.md` front matter, in the order the template emits it.
+struct PlanMeta<'a> {
+    constellation: &'a str,
+    ra: &'a str,
+    dec: &'a str,
+    rotation: &'a str,
+    sample: &'a str,
+}
+
+const EMPTY_META: PlanMeta<'static> = PlanMeta {
+    constellation: "",
+    ra: "",
+    dec: "",
+    rotation: "",
+    sample: "",
+};
+
+/// A path component that could escape its parent or name a dot-file.
+fn bad_component(s: &str) -> bool {
+    s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\\') || s.contains('\0')
+}
+
+/// Create `CCD/<telescope>/<name>` together with its `plan.md`.
+///
+/// Shared by the index form and `POST /staging/newdest` so a destination made
+/// from the review page is indistinguishable from one made on the index:
+/// `traverse.rs` reads `plan.md` for RA/Dec and for the latest-image fallback,
+/// so a bare directory would behave differently in the inventory.
+///
+/// Errors are human-readable because both callers surface them verbatim.
+fn create_object(
+    root: &std::path::Path,
+    telescope: &str,
+    name: &str,
+    meta: &PlanMeta<'_>,
+) -> Result<PathBuf, String> {
+    if telescope.is_empty() || name.is_empty() {
+        return Err("Please choose a telescope and enter an object name.".to_string());
+    }
+    // The index form only sanitised `name` because its telescope came from a
+    // closed select; this is also reachable from JSON, so both are checked.
+    if bad_component(telescope) {
+        return Err(format!("Invalid telescope name: {telescope}"));
+    }
+    if bad_component(name) {
+        return Err(format!("Invalid object name: {name}"));
+    }
+    if !root.join(telescope).is_dir() {
+        return Err(format!("Telescope directory not found: {telescope}"));
+    }
+    // Belt and braces: prove the joined path stays under the CCD root even
+    // though the components are already sanitised. The candidate must be
+    // absolute — resolve_within canonicalizes the *parent*, and a relative
+    // parent would be resolved against the process CWD, not the root.
+    let root_real = std::fs::canonicalize(root).map_err(|e| format!("CCD root: {e}"))?;
+    let obj_dir =
+        staging::resolve_within(&root_real, &root_real.join(telescope).join(name).to_string_lossy())?;
+    if obj_dir.exists() {
+        return Err(format!(
+            "Object directory already exists: {telescope}/{name}"
+        ));
+    }
+    (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&obj_dir)?;
+        let mut fm = Vec::new();
+        if !meta.constellation.is_empty() {
+            fm.push(format!(
+                "constellation: {}",
+                expand_constellation(meta.constellation)
+            ));
+        }
+        if !meta.ra.is_empty() {
+            fm.push(format!("ra: {}", meta.ra));
+        }
+        if !meta.dec.is_empty() {
+            fm.push(format!("dec: {}", meta.dec));
+        }
+        if !meta.rotation.is_empty() {
+            fm.push(format!("rotation: {}", meta.rotation));
+        }
+        if !meta.sample.is_empty() {
+            fm.push(format!("link: {}", meta.sample));
+        }
+        let mut content = String::new();
+        if !fm.is_empty() {
+            content.push_str("---\n");
+            content.push_str(&fm.join("\n"));
+            content.push('\n');
+            content.push_str("---\n\n");
+        }
+        content.push_str(&format!("# {name}\n\n## Plan\n"));
+        std::fs::write(obj_dir.join("plan.md"), content)?;
+        Ok(())
+    })()
+    .map_err(|e| format!("Failed to create {}: {e}", obj_dir.display()))?;
+    Ok(obj_dir)
+}
+
 async fn add_object(
     State(state): State<Arc<AppState>>,
     Form(form): Form<AddForm>,
@@ -295,87 +508,57 @@ async fn add_object(
     let rotation = form.rotation.unwrap_or_default().trim().to_string();
     let sample = form.sample.unwrap_or_default().trim().to_string();
 
-    if telescope.is_empty() || name.is_empty() {
-        return redirect_with_flash(
-            "error",
-            "Please choose a telescope and enter an object name.",
-        );
-    }
-
-    let tel_dir = state.root.join(&telescope);
-    if !tel_dir.is_dir() {
-        return redirect_with_flash(
-            "error",
-            &format!("Telescope directory not found: {telescope}"),
-        );
-    }
-
-    if name.contains('/')
-        || name.contains('\\')
-        || name.contains('\0')
-        || name == "."
-        || name == ".."
-    {
-        return redirect_with_flash("error", "Invalid object name.");
-    }
-
-    let obj_dir = state.root.join(&telescope).join(&name);
-    if obj_dir.exists() {
-        return redirect_with_flash(
-            "error",
-            &format!("Object directory already exists: {telescope}/{name}"),
-        );
-    }
-
-    let plan_path = obj_dir.join("plan.md");
-    if let Err(e) = (|| -> std::io::Result<()> {
-        std::fs::create_dir_all(&obj_dir)?;
-        let mut fm = Vec::new();
-        if !constellation.is_empty() {
-            fm.push(format!(
-                "constellation: {}",
-                expand_constellation(&constellation)
-            ));
+    let meta = PlanMeta {
+        constellation: &constellation,
+        ra: &ra,
+        dec: &dec,
+        rotation: &rotation,
+        sample: &sample,
+    };
+    match create_object(&state.root, &telescope, &name, &meta) {
+        Ok(_) => {
+            // Force cache refresh
+            state.cache.lock().unwrap().records = None;
+            redirect_with_flash("ok", &format!("Created {telescope}/{name}/plan.md"))
         }
-        if !ra.is_empty() {
-            fm.push(format!("ra: {ra}"));
-        }
-        if !dec.is_empty() {
-            fm.push(format!("dec: {dec}"));
-        }
-        if !rotation.is_empty() {
-            fm.push(format!("rotation: {rotation}"));
-        }
-        if !sample.is_empty() {
-            fm.push(format!("link: {sample}"));
-        }
-        let mut content = String::new();
-        if !fm.is_empty() {
-            content.push_str("---\n");
-            content.push_str(&fm.join("\n"));
-            content.push('\n');
-            content.push_str("---\n\n");
-        }
-        content.push_str(&format!("# {name}\n\n## Plan\n"));
-        std::fs::write(&plan_path, content)?;
-        Ok(())
-    })() {
-        return redirect_with_flash(
-            "error",
-            &format!("Failed to create {}: {e}", obj_dir.display()),
-        );
+        Err(e) => redirect_with_flash("error", &e),
     }
+}
 
-    // Force cache refresh
-    {
-        let mut cache = state.cache.lock().unwrap();
-        cache.records = None;
-    }
+#[derive(Deserialize)]
+struct NewDestRequest {
+    telescope: String,
+    name: String,
+}
 
-    redirect_with_flash(
-        "ok",
-        &format!("Created {telescope}/{name}/plan.md"),
-    )
+/// Create a new `CCD/<telescope>/<object>` destination from the review page.
+///
+/// `apply` deliberately still never creates directories: creating one is an
+/// explicit, visible action, so a typo in a batch cannot quietly scatter files
+/// into a fresh directory.
+async fn staging_newdest(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<NewDestRequest>,
+) -> Result<Json<staging::Destination>, (StatusCode, String)> {
+    let telescope = req.telescope.trim().to_string();
+    let name = req.name.trim().to_string();
+    let st = state.clone();
+    let (tel, nm) = (telescope.clone(), name.clone());
+    let created = tokio::task::spawn_blocking(move || {
+        create_object(&st.root, &tel, &nm, &EMPTY_META)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    // A new object dir under the CCD root is invisible to root_mtime().
+    state.cache.lock().unwrap().records = None;
+
+    Ok(Json(staging::Destination {
+        label: format!("{telescope}/{name}"),
+        name,
+        path: created.to_string_lossy().into_owned(),
+    }))
 }
 
 async fn edit_plan_get(
@@ -578,6 +761,52 @@ async fn astrobin_lookup(
         .into_response()
 }
 
+// --- Compendium routes (lazy: nothing loads until these are hit) ---
+
+async fn compendium_page(State(state): State<Arc<AppState>>) -> Response {
+    let available = state.compendium_dir.join("objects.json").exists();
+    let observer = compendium::Observer { latitude: state.latitude, longitude: state.longitude };
+    let when = chrono::Local::now().format("%Y-%m-%dT%H:%M").to_string();
+    Html(compendium::render_compendium_page(available, observer, &when)).into_response()
+}
+
+async fn compendium_data(State(state): State<Arc<AppState>>) -> Response {
+    match compendium::get_objects(&state.compendium_dir) {
+        Ok(objs) => Json(objs.as_ref()).into_response(),
+        Err(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+    }
+}
+
+async fn compendium_thumb(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+) -> Response {
+    let not_found = || (StatusCode::NOT_FOUND, "Not found").into_response();
+    let Ok(objs) = compendium::get_objects(&state.compendium_dir) else {
+        return not_found();
+    };
+    let Some(obj) = objs.iter().find(|o| o.id == id) else {
+        return not_found();
+    };
+    let Some(thumb) = obj.thumb.as_ref() else {
+        return not_found();
+    };
+    // Filename comes from our own JSON, but guard anyway.
+    if thumb.contains('/') || thumb.contains('\\') || thumb.contains("..") || thumb.contains('\0') {
+        return not_found();
+    }
+    let path = state.compendium_dir.join("thumbs").join(thumb);
+    let Ok(content) = std::fs::read(&path) else {
+        return not_found();
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(Body::from(content))
+        .unwrap()
+}
+
 // --- Helpers ---
 
 fn resolve_object(
@@ -641,4 +870,264 @@ fn redirect_with_flash(cat: &str, msg: &str) -> Response {
         "/".parse().unwrap(),
     );
     (StatusCode::SEE_OTHER, headers).into_response()
+}
+
+// --- Staging review routes ---
+
+#[derive(Deserialize)]
+struct StagingQuery {
+    dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PreviewQuery {
+    path: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ApplyRequest {
+    dir: String,
+    pushes: Vec<staging::PushItem>,
+    deletes: Vec<String>,
+}
+
+async fn staging_index(
+    State(state): State<Arc<AppState>>,
+) -> Result<Html<String>, (StatusCode, String)> {
+    let sr = state
+        .staging_root
+        .clone()
+        .ok_or((StatusCode::NOT_FOUND, "staging review is not enabled".to_string()))?;
+    let sr2 = sr.clone();
+    let dirs = tokio::task::spawn_blocking(move || staging::list_staging_dirs(&sr2))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Html(render_staging_index(&sr.to_string_lossy(), &dirs)))
+}
+
+async fn staging_review(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StagingQuery>,
+) -> Result<Html<String>, (StatusCode, String)> {
+    let raw = q.dir.ok_or((StatusCode::BAD_REQUEST, "dir is required".to_string()))?;
+    let dir = state.staging_path(&raw)?;
+    if !dir.is_dir() {
+        return Err((StatusCode::NOT_FOUND, "not a directory".to_string()));
+    }
+    Ok(Html(render_staging_review(&dir.to_string_lossy())))
+}
+
+async fn staging_manifest(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StagingQuery>,
+) -> Result<Json<Manifest>, (StatusCode, String)> {
+    let raw = q.dir.ok_or((StatusCode::BAD_REQUEST, "dir is required".to_string()))?;
+    let dir = state.staging_path(&raw)?;
+    if !dir.is_dir() {
+        return Err((StatusCode::NOT_FOUND, "not a directory".to_string()));
+    }
+    // A full scan is CPU- and I/O-heavy; keep it off the async worker threads.
+    let st = state.clone();
+    let m = tokio::task::spawn_blocking(move || st.manifest_for(&dir))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(m))
+}
+
+async fn staging_preview(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<PreviewQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let raw = q.path.ok_or((StatusCode::BAD_REQUEST, "path is required".to_string()))?;
+    let path = state.staging_path(&raw)?;
+    if !path.is_file() {
+        return Err((StatusCode::NOT_FOUND, "not a file".to_string()));
+    }
+    let cache = state
+        .previews
+        .clone()
+        .ok_or((StatusCode::NOT_FOUND, "staging review is not enabled".to_string()))?;
+
+    let meta = std::fs::metadata(&path).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let key = staging::preview_key(&path, &meta);
+
+    // One decode at a time: each render uses every core for a few hundred ms.
+    let _permit = state
+        .render_permits
+        .acquire()
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "closed".to_string()))?;
+
+    let (p, k) = (path.clone(), key);
+    let bytes = tokio::task::spawn_blocking(move || cache.get_or_render(&p, k))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        // Keyed on path+mtime+size, so a cached entry is immutable.
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(Body::from(bytes))
+        .unwrap())
+}
+
+async fn staging_destinations(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<staging::Destination>>, (StatusCode, String)> {
+    let root = state.root.clone();
+    // Two-level read_dir, deliberately NOT get_records(): that path takes a
+    // std Mutex across a traverse measured at ~48 s, which would stall every
+    // other request.
+    let dirs = tokio::task::spawn_blocking(move || staging::list_destinations(&root))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(dirs))
+}
+
+/// Filenames already in a destination, so the UI can flag collisions before
+/// anything is written.
+async fn staging_destfiles(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StagingQuery>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let raw = q.dir.ok_or((StatusCode::BAD_REQUEST, "dir is required".to_string()))?;
+    let dir = state.ccd_path(&raw)?;
+    let files = tokio::task::spawn_blocking(move || staging::dest_files(&dir, 20_000))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(files))
+}
+
+async fn staging_apply(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ApplyRequest>,
+) -> Result<Json<staging::ApplyReport>, (StatusCode, String)> {
+    let dir = state.staging_path(&req.dir)?;
+    if !dir.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "dir is not a directory".to_string()));
+    }
+    if req.pushes.is_empty() && req.deletes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "nothing to do".to_string()));
+    }
+
+    let processed: Vec<String> = req
+        .pushes
+        .iter()
+        .map(|p| p.src.clone())
+        .chain(req.deletes.iter().cloned())
+        .collect();
+    let dir_key = dir.to_string_lossy().to_string();
+
+    // Snapshot the cache keys first: after a move the source's stat is gone,
+    // so the key can never be recomputed later. Load the manifest if the UI
+    // has not already fetched it.
+    state.manifest_for(&dir);
+    let keys = state.snapshot_keys(&dir_key, &processed);
+
+    let st = state.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        staging::apply(&dir, &st.root, &req.pushes, &req.deletes)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    state.drop_frames_from_manifest(&dir_key, &processed);
+    if let Some(p) = &state.previews {
+        p.drop_keys(&keys);
+    }
+
+    // Pushes land in CCD/<tel>/<obj>, which bumps the *object* dir's mtime —
+    // root_mtime() only stats entries of the root, so the inventory cache
+    // cannot notice on its own. Every other mutator nulls it explicitly.
+    if report.pushed > 0 {
+        state.cache.lock().unwrap().records = None;
+    }
+
+    Ok(Json(report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "astro_newdest_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("81GT")).unwrap();
+        d
+    }
+
+    #[test]
+    fn create_object_makes_the_dir_and_plan_md() {
+        let root = scratch("basic");
+        let meta = EMPTY_META;
+        let created = create_object(&root, "81GT", "Jacoby1", &meta).unwrap();
+        assert_eq!(created, root.join("81GT").join("Jacoby1"));
+        assert!(created.is_dir());
+        let plan = std::fs::read_to_string(created.join("plan.md")).unwrap();
+        assert_eq!(plan, "# Jacoby1\n\n## Plan\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn create_object_writes_front_matter_when_given() {
+        let root = scratch("meta");
+        let meta = PlanMeta {
+            constellation: "Cyg",
+            ra: "20h",
+            dec: "",
+            rotation: "",
+            sample: "",
+        };
+        let created = create_object(&root, "81GT", "M39", &meta).unwrap();
+        let plan = std::fs::read_to_string(created.join("plan.md")).unwrap();
+        assert!(plan.starts_with("---\nconstellation: "), "{plan}");
+        assert!(plan.contains("ra: 20h"), "{plan}");
+        assert!(!plan.contains("dec:"), "{plan}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn create_object_refuses_names_that_escape() {
+        let root = scratch("escape");
+        let meta = EMPTY_META;
+        for bad in ["..", "../81GT", "a/b", "a\\b", ".", "\0"] {
+            assert!(
+                create_object(&root, "81GT", bad, &meta).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        // Nothing was created outside the telescope dir.
+        assert_eq!(
+            std::fs::read_dir(root.join("81GT")).unwrap().count(),
+            0,
+            "a rejected name still created something"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn create_object_refuses_a_telescope_that_is_not_a_directory() {
+        let root = scratch("tel");
+        let meta = EMPTY_META;
+        assert!(create_object(&root, "Pier", "X", &meta).is_err());
+        assert!(create_object(&root, "../RC", "X", &meta).is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn create_object_never_adopts_an_existing_directory() {
+        let root = scratch("exists");
+        let meta = EMPTY_META;
+        assert!(create_object(&root, "81GT", "Dup", &meta).is_ok());
+        let err = create_object(&root, "81GT", "Dup", &meta).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

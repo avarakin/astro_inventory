@@ -11,3 +11,17 @@ server.log
 # Added by cargo
 
 /target
+
+# Extracted Compendium data (regenerate with `make compendium`)
+/data/
+
+# Local server config (machine-specific paths)
+/config.json
+
+# Preview JPEG cache (default location; also set via --cache)
+.cache/
+
+# Large source spreadsheet for `make compendium` (not in the repo)
+/Compendium.xls
+
+wget-log
