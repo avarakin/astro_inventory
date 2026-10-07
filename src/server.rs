@@ -750,30 +750,21 @@ async fn astrobin_lookup(
     let img = &results[0];
     let sol = img.get("solution").unwrap_or(&serde_json::Value::Null);
 
-    // Convert RA from decimal degrees to HMS
-    let ra_str = if sol.get("ra").is_some() {
-        let ra_deg = sol["ra"].as_f64().unwrap_or(0.0) % 360.0;
-        let total_sec = ra_deg * 240.0;
-        let h = (total_sec / 3600.0) as i64;
-        let m = ((total_sec % 3600.0) / 60.0) as i64;
-        let s = (total_sec % 60.0) as i64;
-        format!("{h:02}h{m:02}m{s:02}s")
-    } else {
-        String::new()
-    };
-
-    // Convert DEC from decimal degrees to DMS
-    let dec_str = if sol.get("dec").is_some() {
-        let dec_deg = sol["dec"].as_f64().unwrap_or(0.0);
-        let sign = if dec_deg >= 0.0 { "+" } else { "-" };
-        let dec_abs = dec_deg.abs();
-        let d = dec_abs as i64;
-        let m = ((dec_abs - d as f64) * 60.0) as i64;
-        let s = (((dec_abs - d as f64) * 60.0 - m as f64) * 60.0) as i64;
-        format!("{sign}{d}\u{00b0}{m:02}\u{2032}{s:02}\u{2033}")
-    } else {
-        String::new()
-    };
+    // AstroBin serialises coordinates as decimal-degree *strings* (`"ra":
+    // "25.760"`), so a bare `as_f64()` finds nothing and the form fills with
+    // `00h00m00s`. The `advanced*` fields are the plate-solved values and carry
+    // more precision, so they win when present. No parsable value leaves the
+    // field blank rather than asserting a coordinate at the equator.
+    let ra_str = sol
+        .get("advancedRa")
+        .and_then(deg_value)
+        .or_else(|| sol.get("ra").and_then(deg_value))
+        .map(ra_hms);
+    let dec_str = sol
+        .get("advancedDec")
+        .and_then(deg_value)
+        .or_else(|| sol.get("dec").and_then(deg_value))
+        .map(dec_dms);
 
     let name = img.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
     let constellation = img
@@ -787,11 +778,36 @@ async fn astrobin_lookup(
         Json(serde_json::json!({
             "name": name,
             "constellation": constellation,
-            "ra": ra_str,
-            "dec": dec_str,
+            "ra": ra_str.unwrap_or_default(),
+            "dec": dec_str.unwrap_or_default(),
         })),
     )
         .into_response()
+}
+
+/// Accept a coordinate as a JSON number **or** a numeric string.
+fn deg_value(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+}
+
+/// Decimal degrees → `HHhMMmSSs`.
+fn ra_hms(ra_deg: f64) -> String {
+    let total_sec = (ra_deg % 360.0) * 240.0;
+    let h = (total_sec / 3600.0) as i64;
+    let m = ((total_sec % 3600.0) / 60.0) as i64;
+    let s = (total_sec % 60.0) as i64;
+    format!("{h:02}h{m:02}m{s:02}s")
+}
+
+/// Decimal degrees → `±DD°MM′SS″`.
+fn dec_dms(dec_deg: f64) -> String {
+    let sign = if dec_deg >= 0.0 { "+" } else { "-" };
+    let dec_abs = dec_deg.abs();
+    let d = dec_abs as i64;
+    let m = ((dec_abs - d as f64) * 60.0) as i64;
+    let s = (((dec_abs - d as f64) * 60.0 - m as f64) * 60.0) as i64;
+    format!("{sign}{d}\u{00b0}{m:02}\u{2032}{s:02}\u{2033}")
 }
 
 // --- Compendium routes (lazy: nothing loads until these are hit) ---
@@ -1117,6 +1133,42 @@ async fn review_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AstroBin encodes coordinates as decimal-degree *strings* (`"ra":
+    /// "25.760"`); the reader must accept both strings and JSON numbers.
+    #[test]
+    fn astrobin_degrees_accept_string_encoding() {
+        let ra = serde_json::json!("25.760");
+        let dec = serde_json::json!("13.648");
+        assert_eq!(ra_hms(deg_value(&ra).unwrap()), "01h43m02s");
+        assert_eq!(dec_dms(deg_value(&dec).unwrap()), "+13\u{00b0}38\u{2032}52\u{2033}");
+        assert_eq!(deg_value(&serde_json::json!(25.760)), Some(25.760));
+        // The plate-solved fields are more precise and must not lose seconds.
+        assert_eq!(
+            dec_dms(deg_value(&serde_json::json!("13.647493760")).unwrap()),
+            "+13\u{00b0}38\u{2032}50\u{2033}"
+        );
+    }
+
+    #[test]
+    fn southern_declination_keeps_its_sign() {
+        assert_eq!(
+            dec_dms(deg_value(&serde_json::json!("-29.5598")).unwrap()),
+            "-29\u{00b0}33\u{2032}35\u{2033}"
+        );
+    }
+
+    #[test]
+    fn unparseable_coordinate_stays_blank() {
+        for v in [serde_json::json!(""), serde_json::json!("n/a"), serde_json::Value::Null] {
+            assert_eq!(deg_value(&v), None, "{v} must not yield a coordinate");
+        }
+        // RA wraps at 360°, not 24h.
+        assert_eq!(
+            ra_hms(deg_value(&serde_json::json!("359.99")).unwrap()),
+            "23h59m57s"
+        );
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
