@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
@@ -18,7 +19,7 @@ use crate::render::{
     render_pager, render_review, render_review_index, sort_records,
 };
 use crate::traverse::{build_row, traverse, ObjectRecord};
-use crate::review::{self, Manifest, PreviewCache};
+use crate::review::{self, Manifest, PreviewCache, PreviewState};
 use astro_inventory::compendium;
 
 /// Shared application state.
@@ -42,6 +43,9 @@ pub struct AppState {
     /// Walked destination list. Rebuilt after anything that can add a directory
     /// (apply, newdest) — a full walk of ~1,900 dirs measured 1.05 s.
     dests: Mutex<Option<Vec<review::Destination>>>,
+    /// Preview keys that failed to render. A corrupt FITS is not retried every
+    /// sweep pass; a changed mtime/size produces a new key and is retried.
+    failed_keys: Mutex<HashSet<u64>>,
     /// Serializes full FITS decodes: each one saturates rayon for ~250 ms.
     render_permits: Semaphore,
 }
@@ -83,6 +87,7 @@ impl AppState {
             previews,
             manifests: Mutex::new(HashMap::new()),
             dests: Mutex::new(None),
+            failed_keys: Mutex::new(HashSet::new()),
             render_permits: Semaphore::new(1),
         })
     }
@@ -1035,6 +1040,78 @@ async fn review_preview(
         .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
         .body(Body::from(bytes))
         .unwrap())
+}
+
+/// Sweep the staging tree for missing previews, `interval` apart. The first
+/// pass runs immediately at startup, so the review screen finds previews
+/// already rendered.
+pub fn spawn_preview_sweep(state: Arc<AppState>, interval: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let r = sweep_once(&state).await;
+            println!(
+                "[preview-sweep] scanned {} rendered {} cached {} skipped {} failed {}",
+                r.scanned,
+                r.rendered,
+                r.existing,
+                r.skipped_failed,
+                r.failed.len()
+            );
+            for (p, e) in r.failed.iter().take(5) {
+                println!("[preview-sweep] failed {p}: {e}");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+/// One pass. The render permit is taken **per file** and released after each
+/// render, so an interactive preview request interleaves with the sweep and two
+/// FITS never decode at once.
+async fn sweep_once(state: &Arc<AppState>) -> review::SweepReport {
+    let (Some(staging), Some(cache)) = (state.staging_root.clone(), state.previews.clone()) else {
+        return review::SweepReport::default();
+    };
+    // The walk goes to the blocking pool; each per-file stat is one syscall.
+    let files = tokio::task::spawn_blocking(move || review::list_images(&staging))
+        .await
+        .unwrap_or_default();
+    let mut report = review::SweepReport::default();
+    for p in files {
+        report.scanned += 1;
+        let (key, st) = review::preview_state(&cache, &p);
+        match st {
+            PreviewState::Cached => report.existing += 1,
+            PreviewState::Unreadable => {
+                report.failed.push((p.to_string_lossy().into_owned(), "stat failed".to_string()));
+            }
+            PreviewState::Missing => {
+                if state.failed_keys.lock().unwrap().contains(&key) {
+                    report.skipped_failed += 1;
+                    continue;
+                }
+                let Ok(permit) = state.render_permits.acquire().await else {
+                    break;
+                };
+                let (p2, k, c) = (p.clone(), key, cache.clone());
+                let out = tokio::task::spawn_blocking(move || c.get_or_render(&p2, k)).await;
+                // Released only after the render completes, so the next waiter
+                // (an interactive request) gets the permit, not the sweep.
+                drop(permit);
+                match out {
+                    Ok(Ok(_)) => report.rendered += 1,
+                    Ok(Err(e)) => {
+                        state.failed_keys.lock().unwrap().insert(key);
+                        report.failed.push((p.to_string_lossy().into_owned(), e.to_string()));
+                    }
+                    Err(_) => {
+                        report.failed.push((p.to_string_lossy().into_owned(), "render task panicked".to_string()));
+                    }
+                }
+            }
+        }
+    }
+    report
 }
 
 async fn review_destinations(

@@ -36,6 +36,10 @@ struct Cli {
     #[arg(long)]
     nav_repeat_ms: Option<u64>,
 
+    /// Minutes between staging preview sweeps; 0 disables the sweep
+    #[arg(long)]
+    preview_sweep_min: Option<u64>,
+
     /// Where rendered preview JPEGs are cached. Must live OUTSIDE the staging
     /// tree: every staging telescope dir is a Syncthing folder, so anything
     /// written inside it replicates to the capture machines.
@@ -74,6 +78,7 @@ struct Config {
     longitude: Option<f64>,
     review_roots: Option<Vec<PathBuf>>,
     nav_repeat_ms: Option<u64>,
+    preview_sweep_min: Option<u64>,
 }
 
 /// Precedence: CLI flag > config file > built-in default.
@@ -131,6 +136,9 @@ fn main() -> anyhow::Result<()> {
     // 500 ms is the default: a held arrow scrolls at two frames per second,
     // which stays under the ~270 ms cold preview render.
     let nav_repeat_ms = pick(cli.nav_repeat_ms, cfg.nav_repeat_ms, 500);
+    // 5 min: a full pass over 1,283 staging files renders the ~450 missing
+    // previews in ~2 minutes, so a pass is cheap and the interval is not.
+    let preview_sweep_min = pick(cli.preview_sweep_min, cfg.preview_sweep_min, 5u64);
     // The CCD root and staging are always reviewable; config/CLI add more.
     let mut review_roots: Vec<PathBuf> = cli.review_roots;
     for r in cfg.review_roots.unwrap_or_default() {
@@ -186,12 +194,19 @@ fn main() -> anyhow::Result<()> {
         nav_repeat_ms,
     );
 
+    let sweep_state = state.clone();
     let app = server::build_app(state);
 
     let addr = format!("0.0.0.0:{}", cli.port);
     println!("Listening on http://{addr}");
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
+        if preview_sweep_min > 0 {
+            println!(
+                "Preview sweep: staging tree every {preview_sweep_min} min (first pass now)"
+            );
+            server::spawn_preview_sweep(sweep_state, std::time::Duration::from_secs(preview_sweep_min * 60));
+        }
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
         Ok::<_, anyhow::Error>(())
@@ -242,6 +257,16 @@ mod tests {
         assert_eq!(pick(None, None, 500u64), 500);
         assert_eq!(pick(None, Some(120), 500), 120);
         assert_eq!(pick(Some(800), Some(120), 500), 800);
+    }
+
+    /// The sweep interval follows the same precedence as every other knob, and
+    /// `0` disables the sweep.
+    #[test]
+    fn preview_sweep_interval_is_cli_over_config_over_default() {
+        use super::pick;
+        assert_eq!(pick(None, None, 5u64), 5);
+        assert_eq!(pick(None, Some(10), 5), 10);
+        assert_eq!(pick(Some(0), Some(10), 5), 0);
     }
 
     #[test]

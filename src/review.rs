@@ -292,6 +292,10 @@ pub struct PreviewCache {
 
 impl PreviewCache {
     pub fn new(root: PathBuf) -> Self {
+        // The sweep writes JPEGs straight into `previews/`; make sure it exists.
+        // A failure is not fatal here — a render that cannot write is recorded as
+        // a failed key and retried on the next pass.
+        let _ = fs::create_dir_all(root.join("previews"));
         Self { root }
     }
 
@@ -314,6 +318,45 @@ impl PreviewCache {
             let _ = fs::remove_file(self.jpeg_path(*k));
         }
     }
+}
+
+// --- Preview sweep ----------------------------------------------------------
+
+/// What a sweep pass found for one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewState {
+    /// The cache already holds a JPEG for this path + mtime + size.
+    Cached,
+    /// No cached JPEG; the file is stat'able and can be rendered.
+    Missing,
+    /// The file cannot be stat'ed (deleted mid-sweep, permission, dangling link).
+    Unreadable,
+}
+
+/// Classify one file for the sweep: its cache key and whether a preview exists.
+pub fn preview_state(cache: &PreviewCache, path: &Path) -> (u64, PreviewState) {
+    let Ok(meta) = fs::metadata(path) else {
+        return (0, PreviewState::Unreadable);
+    };
+    let key = preview_key(path, &meta);
+    let state = if cache.jpeg_path(key).exists() {
+        PreviewState::Cached
+    } else {
+        PreviewState::Missing
+    };
+    (key, state)
+}
+
+/// One pass over a staging tree.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    pub scanned: usize,
+    pub rendered: usize,
+    pub existing: usize,
+    /// Files whose key is in the known-failure set: not retried every pass.
+    pub skipped_failed: usize,
+    /// Files that failed **this** pass (path, error).
+    pub failed: Vec<(String, String)>,
 }
 
 // --- Path guards ------------------------------------------------------------
@@ -706,6 +749,60 @@ mod tests {
     fn fnv1a_is_stable_and_sensitive() {
         assert_eq!(fnv1a(b"abc"), fnv1a(b"abc"));
         assert_ne!(fnv1a(b"abc"), fnv1a(b"abd"));
+    }
+
+    /// The sweep classifies by cache key: a JPEG for path+mtime+size is
+    /// `Cached`, an absent one is `Missing`, and a file that cannot be stat'ed
+    /// is `Unreadable`.
+    #[test]
+    fn sweep_classifies_files_by_cache_key() {
+        let staging = tmpdir("sweep");
+        let cache_dir = tmpdir("sweep_cache");
+        let cache = PreviewCache::new(cache_dir.clone());
+        let f = staging.join("obj").join("a.fits");
+        fs::create_dir_all(staging.join("obj")).unwrap();
+        fs::write(&f, b"pixels").unwrap();
+
+        let (key, st) = preview_state(&cache, &f);
+        assert_eq!(st, PreviewState::Missing);
+        assert_ne!(key, 0);
+
+        fs::write(cache.jpeg_path(key), b"jpeg").unwrap();
+        assert_eq!(preview_state(&cache, &f).1, PreviewState::Cached);
+
+        // A changed size is a new key, so the old JPEG no longer counts.
+        fs::write(&f, b"pixels-longer").unwrap();
+        let (k2, st2) = preview_state(&cache, &f);
+        assert_ne!(k2, key);
+        assert_eq!(st2, PreviewState::Missing);
+
+        assert_eq!(
+            preview_state(&cache, &staging.join("gone.fits")).1,
+            PreviewState::Unreadable
+        );
+        fs::remove_dir_all(&staging).ok();
+        fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// A corrupt file fails to render and leaves **no** JPEG behind, so its key
+    /// stays `Missing` and the sweep's known-failure set is what stops it being
+    /// retried every pass.
+    #[test]
+    fn a_corrupt_fits_fails_render_and_leaves_no_cached_jpeg() {
+        let staging = tmpdir("sweep_bad");
+        let cache_dir = tmpdir("sweep_bad_cache");
+        let cache = PreviewCache::new(cache_dir.clone());
+        let f = staging.join("bad.fits");
+        fs::write(&f, b"not a fits file").unwrap();
+        let (key, st) = preview_state(&cache, &f);
+        assert_eq!(st, PreviewState::Missing);
+        assert!(cache.get_or_render(&f, key).is_err());
+        assert!(
+            !cache.jpeg_path(key).exists(),
+            "a failed render must leave no JPEG"
+        );
+        fs::remove_dir_all(&staging).ok();
+        fs::remove_dir_all(&cache_dir).ok();
     }
 
     #[test]
