@@ -1,8 +1,9 @@
-//! Staging review: scan a staging object directory, rank its frames, and
-//! batch-push/delete them.
+//! Generic directory review: scan a directory, rank its frames, and batch
+//! move / copy / symlink / delete the marked set.
 //!
-//! The unit of work is always **one staging object directory** — the whole
-//! staging area is never processed.
+//! The unit of work is always **one directory** — the whole review root is
+//! never processed. The screen is generic: any directory inside an allowed
+//! review root can be opened, not only a staging object dir.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -15,11 +16,17 @@ use serde::{Deserialize, Serialize};
 use crate::traverse::{filter_label, parse_filter};
 use astro_inventory::fits_preview::{self, FitError, RenderOptions};
 
-/// Extensions treated as reviewable frames.
+/// Extensions treated as reviewable frames. Non-FITS files are not listed:
+/// there is no decoder for them and the screen is FITS-driven by design.
 pub const IMAGE_EXTS: &[&str] = &["fits", "fit"];
 
 /// Fallback used when a header carries no IMAGETYP.
 const DEFAULT_IMAGETYPE: &str = "Light";
+
+/// Depth cap for directory walks. The CCD tree is `root/tel/obj` and staging
+/// is `staging/tel/obj`; a cap keeps a walk over 420 object dirs cheap and
+/// stops a symlinked tree from being descended forever.
+const MAX_WALK_DEPTH: usize = 4;
 
 // --- Hashing ----------------------------------------------------------------
 
@@ -116,7 +123,7 @@ fn is_image(path: &Path) -> bool {
 }
 
 /// Collect image files under `dir`, recursively. Calibration directories are
-/// deliberately **included** — they are reviewable and pushable like any other.
+/// deliberately **included** — they are reviewable and actionable like any other.
 pub fn list_images(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -140,8 +147,8 @@ pub fn list_images(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Count image files sitting **directly** in `dir` (no recursion). Used to
-/// decide whether a telescope directory is itself reviewable, so it does not
-/// double-count the object directories nested inside it.
+/// decide whether a directory is itself reviewable, so it does not double-count
+/// the object directories nested inside it.
 fn count_direct_images(dir: &Path) -> usize {
     let Ok(entries) = fs::read_dir(dir) else { return 0 };
     entries
@@ -149,6 +156,18 @@ fn count_direct_images(dir: &Path) -> usize {
         .map(|e| e.path())
         .filter(|p| p.is_file() && is_image(p))
         .count()
+}
+
+/// Total bytes of the image files sitting **directly** in `dir`.
+fn direct_image_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && is_image(p))
+        .filter_map(|p| fs::metadata(&p).ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 /// Signature of a directory's file set. Cheap: one stat per file, no reads.
@@ -201,9 +220,9 @@ fn scan_frame(p: &Path, dir: &Path) -> Result<Frame, String> {
     })
 }
 
-/// Scan a staging object directory. The per-file FITS work runs in parallel:
-/// measured on the real corpus, a serial pass costs ~76 ms/file (56 s for the
-/// 740-file `Pier/Jacoby1`) while the parallel pass costs ~13 ms/file cold.
+/// Scan one directory. The per-file FITS work runs in parallel: measured on
+/// the real corpus, a serial pass costs ~76 ms/file (56 s for the 740-file
+/// `Pier/Jacoby1`) while the parallel pass costs ~13 ms/file cold.
 pub fn scan(dir: &Path) -> Manifest {
     let files = list_images(dir);
     let signature = dir_signature(dir, &files);
@@ -297,7 +316,7 @@ impl PreviewCache {
     }
 }
 
-// --- Apply ------------------------------------------------------------------
+// --- Path guards ------------------------------------------------------------
 
 /// Reject any path that escapes `base` after resolution. Every client-supplied
 /// path goes through this before touching the filesystem. Canonicalizing the
@@ -320,33 +339,72 @@ pub fn resolve_within(base: &Path, raw: &str) -> Result<PathBuf, String> {
     Ok(full)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PushItem {
-    pub src: String,
-    /// Destination **directory**, validated against the CCD root.
-    pub dst: String,
+/// Resolve a path that may live under **any** of the allowed roots. A path
+/// inside one root is accepted; a path inside none of them is rejected.
+pub fn resolve_within_any(roots: &[PathBuf], raw: &str) -> Result<PathBuf, String> {
+    let mut last = None;
+    for r in roots {
+        match resolve_within(r, raw) {
+            Ok(p) => return Ok(p),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| format!("no review roots configured: {raw}")))
+}
+
+// --- Apply ------------------------------------------------------------------
+
+/// What to do with the marked set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Op {
+    Move,
+    Copy,
+    Symlink,
+    Delete,
+}
+
+impl Op {
+    pub fn needs_destination(self) -> bool {
+        !matches!(self, Op::Delete)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ApplyReport {
-    pub pushed: usize,
+    pub moved: usize,
+    pub copied: usize,
+    pub linked: usize,
     pub deleted: usize,
     pub errors: Vec<String>,
 }
 
-/// Move `src` onto `dst_dir/<basename>`, refusing to clobber.
-///
-/// Push is a **move**: staging is a Syncthing transfer area and it only drains
-/// if the source goes away. `rename` is used first; a cross-filesystem pair
-/// (staging on one mount, CCD on another) falls back to copy + fsync + delete.
-fn move_into(src: &Path, dst_dir: &Path) -> Result<(), String> {
+impl ApplyReport {
+    pub fn touched(&self) -> usize {
+        self.moved + self.copied + self.linked + self.deleted
+    }
+}
+
+/// `dst/<basename of src>`, refusing to clobber anything already there —
+/// including a symlink, which `Path::exists` reports as absent when broken.
+fn target_for(src: &Path, dst_dir: &Path) -> Result<PathBuf, String> {
     let leaf = src
         .file_name()
         .ok_or_else(|| "source has no file name".to_string())?;
     let target = dst_dir.join(leaf);
-    if target.exists() {
+    if fs::symlink_metadata(&target).is_ok() {
         return Err(format!("refusing to overwrite existing {}", target.display()));
     }
+    Ok(target)
+}
+
+/// Move `src` onto `dst_dir/<basename>`, refusing to clobber.
+///
+/// Move is the staging case: a Syncthing transfer area only drains if the
+/// source goes away. `rename` is used first; a cross-filesystem pair falls
+/// back to copy + fsync + delete.
+fn move_into(src: &Path, dst_dir: &Path) -> Result<(), String> {
+    let target = target_for(src, dst_dir)?;
     match fs::rename(src, &target) {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -361,172 +419,250 @@ fn move_into(src: &Path, dst_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Push frames to their chosen destinations and delete the rest of the marked
-/// set.
+/// Copy `src` onto `dst_dir/<basename>`, leaving the source in place.
+fn copy_into(src: &Path, dst_dir: &Path) -> Result<(), String> {
+    let target = target_for(src, dst_dir)?;
+    fs::copy(src, &target).map_err(|e| format!("copy: {e}"))?;
+    File::open(&target)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("fsync: {e}"))?;
+    Ok(())
+}
+
+/// Symlink `dst_dir/<basename>` to `src`, leaving the source in place.
+///
+/// The link target is the **canonical absolute** source path: a relative link
+/// would break the moment the source moves, which is exactly the operation
+/// this screen performs most often.
+fn link_into(src: &Path, dst_dir: &Path) -> Result<(), String> {
+    let target = target_for(src, dst_dir)?;
+    let src_abs = fs::canonicalize(src).map_err(|e| format!("canonicalize source: {e}"))?;
+    std::os::unix::fs::symlink(&src_abs, &target).map_err(|e| format!("symlink: {e}"))?;
+    Ok(())
+}
+
+/// Act on the marked set.
 ///
 /// Deletes are **permanent** — an accepted risk of this workflow. Destinations
-/// must already exist: new objects are created through the existing
-/// "Add a new object" form, never here.
+/// must already exist: new objects are created through the explicit
+/// "＋ new destination" action, never here.
 pub fn apply(
-    staging_dir: &Path,
-    ccd_root: &Path,
-    pushes: &[PushItem],
-    deletes: &[String],
+    src_dir: &Path,
+    roots: &[PathBuf],
+    op: Op,
+    dst_raw: Option<&str>,
+    files: &[String],
 ) -> ApplyReport {
     let mut rep = ApplyReport::default();
 
-    for p in pushes {
-        let src = match resolve_within(staging_dir, &p.src) {
-            Ok(v) => v,
-            Err(e) => {
-                rep.errors.push(format!("{}: {e}", p.src));
-                continue;
-            }
-        };
-        if !src.is_file() {
-            // Re-applying after a partial failure must skip already-moved files
-            // rather than report a fresh error for each.
-            rep.errors.push(format!("{}: not a file (already moved?)", p.src));
-            continue;
-        }
-        let dst_dir = match resolve_within(ccd_root, &p.dst) {
-            Ok(v) if v.is_dir() => v,
+    let dst_dir: Option<PathBuf> = if op.needs_destination() {
+        let raw = dst_raw.unwrap_or("");
+        match resolve_within_any(roots, raw) {
+            Ok(p) if p.is_dir() => Some(p),
             Ok(_) => {
-                rep.errors.push(format!("{}: destination is not a directory: {}", p.src, p.dst));
-                continue;
+                rep.errors.push(format!(
+                    "destination {} does not exist — create it with \"＋ new destination\" on the review page",
+                    raw
+                ));
+                return rep;
             }
             Err(e) => {
                 rep.errors.push(format!(
-                    "{}: destination {} does not exist ({e}) — create it with \"Add a new object\" on the index page",
-                    p.src, p.dst
+                    "destination {} does not exist ({e}) — create it with \"＋ new destination\" on the review page",
+                    raw
                 ));
-                continue;
+                return rep;
             }
-        };
-        match move_into(&src, &dst_dir) {
-            Ok(()) => rep.pushed += 1,
-            Err(e) => rep.errors.push(format!("push {}: {e}", p.src)),
         }
-    }
+    } else {
+        None
+    };
 
-    for raw in deletes {
-        let full = match resolve_within(staging_dir, raw) {
+    for raw in files {
+        let src = match resolve_within(src_dir, raw) {
             Ok(v) => v,
             Err(e) => {
                 rep.errors.push(format!("{raw}: {e}"));
                 continue;
             }
         };
-        if !full.is_file() {
-            rep.errors.push(format!("{raw}: not a file (already deleted?)"));
+        if !src.is_file() {
+            // Re-applying after a partial failure must skip already-processed
+            // files rather than report a fresh error for each.
+            rep.errors.push(format!("{raw}: not a file (already processed?)"));
             continue;
         }
-        match fs::remove_file(&full) {
-            Ok(()) => rep.deleted += 1,
-            Err(e) => rep.errors.push(format!("delete {raw}: {e}")),
+        let r = match op {
+            Op::Delete => fs::remove_file(&src)
+                .map(|()| rep.deleted += 1)
+                .map_err(|e| e.to_string()),
+            _ => {
+                // Delete needs no destination; the other three always have one
+                // by the time this loop runs.
+                let dst = dst_dir.as_ref().expect("op needs a destination");
+                match op {
+                    Op::Move => move_into(&src, dst).map(|()| rep.moved += 1),
+                    Op::Copy => copy_into(&src, dst).map(|()| rep.copied += 1),
+                    Op::Symlink => link_into(&src, dst).map(|()| rep.linked += 1),
+                    Op::Delete => unreachable!(),
+                }
+            }
+        };
+        if let Err(e) = r {
+            rep.errors.push(format!("{} {raw}: {e}", op_label(op)));
         }
     }
 
     rep
 }
 
+pub fn op_label(op: Op) -> &'static str {
+    match op {
+        Op::Move => "move",
+        Op::Copy => "copy",
+        Op::Symlink => "symlink",
+        Op::Delete => "delete",
+    }
+}
+
 // --- Directory browsing -----------------------------------------------------
 
-#[derive(Debug, Serialize)]
-pub struct StagingDir {
+/// A directory that holds reviewable frames, offered by the generic browser.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewDir {
+    /// Absolute path.
     pub path: String,
-    pub name: String,
-    pub telescope: String,
+    /// `root/rel` label, so two roots never look identical.
+    pub label: String,
     pub frames: usize,
     pub bytes: u64,
 }
 
-/// Two-level listing of the staging area: `<staging>/<telescope>/<object>`.
-/// Directories holding images directly under a telescope are listed too.
-pub fn list_staging_dirs(staging: &Path) -> Vec<StagingDir> {
+/// Directories under `roots` that hold frames **directly**. Nested object dirs
+/// are listed; a directory whose frames all live in children is not, so the
+/// browser never double-counts.
+pub fn list_review_dirs(roots: &[PathBuf], cap: usize) -> Vec<ReviewDir> {
     let mut out = Vec::new();
-    let Ok(tels) = fs::read_dir(staging) else { return out };
-    for tel in tels.flatten() {
-        let tp = tel.path();
-        if !tp.is_dir() {
-            continue;
-        }
-        let tel_name = tel.file_name().to_string_lossy().to_string();
-        // `.stfolder`, `.git`, `.syncthing.*`, `.config` — none are telescopes.
-        if tel_name.starts_with('.') {
-            continue;
-        }
-
-        let own = count_direct_images(&tp);
-        if own > 0 {
-            out.push(StagingDir {
-                name: tel_name.clone(),
-                telescope: tel_name.clone(),
-                path: tp.to_string_lossy().to_string(),
-                frames: own,
-                bytes: 0,
-            });
-        }
-
-        let Ok(objs) = fs::read_dir(&tp) else { continue };
-        for obj in objs.flatten() {
-            let op = obj.path();
-            if !op.is_dir() {
+    for root in roots {
+        let root_real = match fs::canonicalize(root) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let root_name = root_real
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let mut stack = vec![(root_real.clone(), 0usize)];
+        let mut visited = 0usize;
+        let mut per_root = Vec::new();
+        while let Some((d, depth)) = stack.pop() {
+            // Bound the walk: a root with thousands of dirs should not be
+            // descended exhaustively on every page load.
+            if visited > cap * 40 {
+                break;
+            }
+            visited += 1;
+            let rel = d.strip_prefix(&root_real).unwrap_or(Path::new(""));
+            let label = if rel.as_os_str().is_empty() {
+                root_name.clone()
+            } else {
+                format!("{root_name}/{}", rel.to_string_lossy())
+            };
+            let n = count_direct_images(&d);
+            if n > 0 {
+                per_root.push(ReviewDir {
+                    path: d.to_string_lossy().to_string(),
+                    label,
+                    frames: n,
+                    bytes: direct_image_bytes(&d),
+                });
+            }
+            if depth >= MAX_WALK_DEPTH {
                 continue;
             }
-            if op.file_name().map_or(true, |n| n.to_string_lossy().starts_with('.')) {
-                continue;
+            let Ok(entries) = fs::read_dir(&d) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                // `.stfolder`, `.git`, `.syncthing.*`, `.config` — never offered.
+                if e.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                stack.push((p, depth + 1));
             }
-            let n = list_images(&op).len();
-            if n == 0 {
-                continue;
-            }
-            out.push(StagingDir {
-                name: obj.file_name().to_string_lossy().to_string(),
-                telescope: tel_name.clone(),
-                path: op.to_string_lossy().to_string(),
-                frames: n,
-                bytes: 0,
-            });
         }
+        // Cap per root: a root with hundreds of directories must not crowd the
+        // other roots out of the list entirely.
+        per_root.truncate(cap);
+        out.append(&mut per_root);
     }
-    out.sort_by(|a, b| a.telescope.cmp(&b.telescope).then_with(|| a.name.cmp(&b.name)));
+    out.sort_by(|a, b| a.label.cmp(&b.label));
     out
 }
 
-/// Immediate sub-directories of the CCD root, offered as push destinations.
-/// Basenames of `CCD/<telescope>/<object>` are matched against the staging
-/// object name to suggest a default.
-pub fn list_destinations(root: &Path) -> Vec<Destination> {
-    let Ok(entries) = fs::read_dir(root) else { return Vec::new() };
-    let mut out: Vec<Destination> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .flat_map(|tel| {
-            let tel_name = tel.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let Ok(objs) = fs::read_dir(&tel) else { return Vec::new() };
-            objs.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .map(|obj| {
-                    let name = obj.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    Destination {
-                        label: format!("{tel_name}/{name}"),
-                        name,
-                        path: obj.to_string_lossy().to_string(),
-                    }
-                })
-                .collect()
-        })
-        .collect();
+/// Every directory under `roots`, offered as an action destination. Basenames
+/// are matched against the reviewed directory's basename to suggest a default.
+pub fn list_destinations(roots: &[PathBuf], cap: usize) -> Vec<Destination> {
+    let mut out = Vec::new();
+    for root in roots {
+        let root_real = match fs::canonicalize(root) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let root_name = root_real
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let mut stack = vec![(root_real.clone(), 0usize)];
+        let mut visited = 0usize;
+        let mut per_root = Vec::new();
+        while let Some((d, depth)) = stack.pop() {
+            if visited > cap * 40 {
+                break;
+            }
+            visited += 1;
+            let rel = d.strip_prefix(&root_real).unwrap_or(Path::new(""));
+            let label = if rel.as_os_str().is_empty() {
+                root_name.clone()
+            } else {
+                format!("{root_name}/{}", rel.to_string_lossy())
+            };
+            per_root.push(Destination {
+                label,
+                name: d.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                path: d.to_string_lossy().to_string(),
+            });
+            if depth >= MAX_WALK_DEPTH {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(&d) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                if e.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                stack.push((p, depth + 1));
+            }
+        }
+        // Cap per root, as above: destinations must stay reachable from every
+        // root, not just the first one.
+        per_root.truncate(cap);
+        out.append(&mut per_root);
+    }
     out.sort_by(|a, b| a.label.cmp(&b.label));
     out
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Destination {
-    /// `telescope/object`, shown in the dropdown.
+    /// `root/telescope/object`, shown in the dropdown.
     pub label: String,
     /// Object basename, used for the fuzzy default match.
     pub name: String,
@@ -553,9 +689,14 @@ pub fn dest_files(dir: &Path, cap: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Builds a root list without `clone`-in-slice noise.
+    fn roots(paths: &[&std::path::Path]) -> Vec<PathBuf> {
+        paths.iter().map(|p| p.to_path_buf()).collect()
+    }
+
     fn tmpdir(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("astro_staging_test_{}_{tag}", std::process::id()));
+        p.push(format!("astro_review_test_{}_{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -586,125 +727,190 @@ mod tests {
     }
 
     #[test]
-    fn push_moves_the_file_and_refuses_to_clobber() {
-        let stage = tmpdir("stage");
-        let root = tmpdir("ccd");
+    fn resolve_within_any_accepts_any_root_and_rejects_outside() {
+        let a = tmpdir("any_a");
+        let b = tmpdir("any_b");
+        fs::write(a.join("x.fits"), b"x").unwrap();
+        fs::write(b.join("y.fits"), b"y").unwrap();
+        let roots = [a.clone(), b.clone()];
+        assert!(resolve_within_any(&roots, a.join("x.fits").to_str().unwrap()).is_ok());
+        assert!(resolve_within_any(&roots, b.join("y.fits").to_str().unwrap()).is_ok());
+        let outside = a.join("../escape.fits");
+        fs::write(&outside, b"z").unwrap();
+        assert!(resolve_within_any(&roots, outside.to_str().unwrap()).is_err());
+        fs::remove_file(&outside).ok();
+        fs::remove_dir_all(&a).ok();
+        fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn move_is_a_move_and_refuses_to_clobber() {
+        let src_dir = tmpdir("mv_src");
+        let root = tmpdir("mv_root");
         let dest = root.join("81GT/M42");
         fs::create_dir_all(&dest).unwrap();
-        let f = stage.join("a.fits");
+        let f = src_dir.join("a.fits");
         fs::write(&f, b"payload").unwrap();
 
         let rep = apply(
-            &stage,
-            &root,
-            &[PushItem { src: f.to_string_lossy().into_owned(), dst: dest.to_string_lossy().into_owned() }],
-            &[],
+            &src_dir,
+            &roots(&[&root]),
+            Op::Move,
+            Some(dest.to_str().unwrap()),
+            &[f.to_string_lossy().into_owned()],
         );
-        assert_eq!(rep.pushed, 1, "{:?}", rep.errors);
+        assert_eq!(rep.moved, 1, "{:?}", rep.errors);
         assert_eq!(fs::read(dest.join("a.fits")).unwrap(), b"payload");
-        assert!(!f.exists(), "push is a MOVE: the staging source must be gone");
+        assert!(!f.exists(), "move must remove the source");
 
         // Re-applying the same request must not create a duplicate or clobber.
         let rep2 = apply(
-            &stage,
-            &root,
-            &[PushItem { src: f.to_string_lossy().into_owned(), dst: dest.to_string_lossy().into_owned() }],
-            &[],
+            &src_dir,
+            &roots(&[&root]),
+            Op::Move,
+            Some(dest.to_str().unwrap()),
+            &[f.to_string_lossy().into_owned()],
         );
-        assert_eq!(rep2.pushed, 0);
+        assert_eq!(rep2.moved, 0);
         assert_eq!(fs::read(dest.join("a.fits")).unwrap(), b"payload", "must not overwrite");
     }
 
     #[test]
-    fn push_into_an_existing_name_is_refused() {
-        let stage = tmpdir("stage_c");
-        let root = tmpdir("ccd_c");
+    fn copy_leaves_the_source_and_refuses_to_clobber() {
+        let src_dir = tmpdir("cp_src");
+        let root = tmpdir("cp_root");
         let dest = root.join("8RC/M57");
         fs::create_dir_all(&dest).unwrap();
-        fs::write(stage.join("dup.fits"), b"new").unwrap();
+        fs::write(src_dir.join("new.fits"), b"new").unwrap();
+        fs::write(src_dir.join("dup.fits"), b"new").unwrap();
         fs::write(dest.join("dup.fits"), b"old").unwrap();
+
         let rep = apply(
-            &stage,
-            &root,
-            &[PushItem { src: stage.join("dup.fits").to_string_lossy().into_owned(), dst: dest.to_string_lossy().into_owned() }],
-            &[],
+            &src_dir,
+            &roots(&[&root]),
+            Op::Copy,
+            Some(dest.to_str().unwrap()),
+            &[src_dir.join("new.fits").to_string_lossy().into_owned(),
+              src_dir.join("dup.fits").to_string_lossy().into_owned()],
         );
-        assert_eq!(rep.pushed, 0);
+        assert_eq!(rep.copied, 1, "{:?}", rep.errors);
+        assert!(src_dir.join("new.fits").exists(), "copy must keep the source");
+        assert_eq!(fs::read(dest.join("new.fits")).unwrap(), b"new");
+        assert_eq!(fs::read(dest.join("dup.fits")).unwrap(), b"old", "must not overwrite");
         assert!(rep.errors.iter().any(|e| e.contains("overwrite")), "{:?}", rep.errors);
-        assert_eq!(fs::read(dest.join("dup.fits")).unwrap(), b"old");
-        assert!(stage.join("dup.fits").exists(), "failed push must leave the source alone");
     }
 
     #[test]
-    fn delete_is_permanent() {
-        let stage = tmpdir("stage_d");
-        let root = tmpdir("ccd_d");
-        fs::create_dir_all(root.join("81GT/x")).unwrap();
-        let f = stage.join("gone.fits");
+    fn symlink_points_at_the_absolute_source_and_keeps_it() {
+        let src_dir = tmpdir("sl_src");
+        let root = tmpdir("sl_root");
+        let dest = root.join("81GT/M42");
+        fs::create_dir_all(&dest).unwrap();
+        let f = src_dir.join("a.fits");
+        fs::write(&f, b"payload").unwrap();
+
+        let rep = apply(
+            &src_dir,
+            &roots(&[&root]),
+            Op::Symlink,
+            Some(dest.to_str().unwrap()),
+            &[f.to_string_lossy().into_owned()],
+        );
+        assert_eq!(rep.linked, 1, "{:?}", rep.errors);
+        assert!(f.exists(), "symlink must leave the source in place");
+
+        let link = dest.join("a.fits");
+        let tgt = fs::read_link(&link).unwrap();
+        assert_eq!(tgt, fs::canonicalize(&f).unwrap(), "link must be absolute");
+        assert_eq!(fs::read(&link).unwrap(), b"payload");
+
+        // A link onto an existing name is refused, and the existing file is untouched.
+        fs::write(dest.join("b.fits"), b"old").unwrap();
+        fs::write(src_dir.join("b.fits"), b"new").unwrap();
+        let rep2 = apply(
+            &src_dir,
+            &roots(&[&root]),
+            Op::Symlink,
+            Some(dest.to_str().unwrap()),
+            &[src_dir.join("b.fits").to_string_lossy().into_owned()],
+        );
+        assert_eq!(rep2.linked, 0);
+        assert_eq!(fs::read(dest.join("b.fits")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn delete_is_permanent_and_needs_no_destination() {
+        let src_dir = tmpdir("del_src");
+        let root = tmpdir("del_root");
+        let f = src_dir.join("gone.fits");
         fs::write(&f, b"x").unwrap();
-        let rep = apply(&stage, &root, &[], &[f.to_string_lossy().into_owned()]);
-        assert_eq!(rep.deleted, 1);
+        let rep = apply(&src_dir, &roots(&[&root]), Op::Delete, None, &[f.to_string_lossy().into_owned()]);
+        assert_eq!(rep.deleted, 1, "{:?}", rep.errors);
         assert!(!f.exists());
     }
 
     #[test]
     fn apply_never_creates_a_missing_destination() {
-        let stage = tmpdir("stage2");
-        let root = tmpdir("ccd2");
+        let src_dir = tmpdir("src2");
+        let root = tmpdir("root2");
         fs::create_dir_all(&root).unwrap();
-        fs::write(stage.join("a.fits"), b"x").unwrap();
+        fs::write(src_dir.join("a.fits"), b"x").unwrap();
         let missing = root.join("81GT/NewObject");
         let rep = apply(
-            &stage,
-            &root,
-            &[PushItem { src: stage.join("a.fits").to_string_lossy().into_owned(), dst: missing.to_string_lossy().into_owned() }],
-            &[],
+            &src_dir,
+            &roots(&[&root]),
+            Op::Move,
+            Some(missing.to_str().unwrap()),
+            &[src_dir.join("a.fits").to_string_lossy().into_owned()],
         );
-        assert_eq!(rep.pushed, 0);
+        assert_eq!(rep.moved, 0);
         assert!(!missing.exists(), "apply must not auto-create destinations");
-        assert!(stage.join("a.fits").exists(), "source must survive a rejected push");
+        assert!(src_dir.join("a.fits").exists(), "source must survive a rejected batch");
         assert!(
-            rep.errors.iter().any(|e| e.contains("Add a new object")),
-            "error should point at the add-object form: {:?}",
+            rep.errors.iter().any(|e| e.contains("new destination")),
+            "error should point at the create form: {:?}",
             rep.errors
         );
     }
 
     #[test]
-    fn apply_rejects_paths_outside_the_staging_dir() {
-        let stage = tmpdir("stage3");
-        let root = tmpdir("ccd3");
+    fn apply_rejects_paths_outside_the_reviewed_dir() {
+        let src_dir = tmpdir("src3");
+        let root = tmpdir("root3");
         fs::create_dir_all(root.join("81GT/x")).unwrap();
-        let outside = stage.join("../outside.fits");
+        let outside = src_dir.join("../outside.fits");
         fs::write(&outside, b"x").unwrap();
         let rep = apply(
-            &stage,
-            &root,
-            &[PushItem { src: outside.to_string_lossy().into_owned(), dst: root.join("81GT/x").to_string_lossy().into_owned() }],
-            &[],
+            &src_dir,
+            &roots(&[&root]),
+            Op::Move,
+            Some(root.join("81GT/x").to_str().unwrap()),
+            &[outside.to_string_lossy().into_owned()],
         );
-        assert_eq!(rep.pushed, 0);
+        assert_eq!(rep.moved, 0);
         assert!(rep.errors.iter().any(|e| e.contains("escapes")), "{:?}", rep.errors);
         assert!(outside.exists());
         fs::remove_file(&outside).ok();
     }
 
     #[test]
-    fn push_destination_is_validated_against_the_ccd_root() {
-        let stage = tmpdir("stage4");
-        let root = tmpdir("ccd4");
+    fn destination_is_validated_against_the_allowed_roots() {
+        let src_dir = tmpdir("src4");
+        let root = tmpdir("root4");
         fs::create_dir_all(root.join("81GT/x")).unwrap();
-        fs::write(stage.join("a.fits"), b"x").unwrap();
-        let escape = root.join("../escape");
+        fs::write(src_dir.join("a.fits"), b"x").unwrap();
+        let escape = root.join("../escape4");
         fs::create_dir_all(&escape).unwrap();
         let rep = apply(
-            &stage,
-            &root,
-            &[PushItem { src: stage.join("a.fits").to_string_lossy().into_owned(), dst: escape.to_string_lossy().into_owned() }],
-            &[],
+            &src_dir,
+            &roots(&[&root]),
+            Op::Move,
+            Some(escape.to_str().unwrap()),
+            &[src_dir.join("a.fits").to_string_lossy().into_owned()],
         );
-        assert_eq!(rep.pushed, 0, "destination outside the CCD root must be refused");
+        assert_eq!(rep.moved, 0, "destination outside the allowed roots must be refused");
         assert!(!escape.join("a.fits").exists());
+        fs::remove_dir_all(&escape).ok();
     }
 
     #[test]
@@ -758,26 +964,77 @@ mod tests {
         fs::write(root.join(".config/ccdciel/a.fits"), b"x").unwrap();
         fs::write(root.join("Pier/.syncthing.tmp/b.fits"), b"x").unwrap();
         fs::write(root.join("Pier/Real/c.fits"), b"x").unwrap();
-        let dirs = list_staging_dirs(&root);
+        let dirs = list_review_dirs(&roots(&[&root]), 100);
         assert_eq!(dirs.len(), 1, "only Pier/Real must survive: {dirs:?}");
-        assert_eq!(dirs[0].telescope, "Pier");
-        assert_eq!(dirs[0].name, "Real");
+        assert_eq!(
+            dirs[0].label,
+            format!("{}/Pier/Real", root.file_name().unwrap().to_string_lossy()),
+            "label must be root-relative"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn telescope_rows_do_not_double_count_object_dirs() {
+    fn browser_rows_do_not_double_count_nested_dirs() {
         let root = tmpdir("twolevel");
         fs::create_dir_all(root.join("Pier/Obj1")).unwrap();
         fs::create_dir_all(root.join("Pier/Obj2")).unwrap();
         fs::create_dir_all(root.join("Empty")).unwrap();
         fs::write(root.join("Pier/Obj1/a.fits"), b"x").unwrap();
         fs::write(root.join("Pier/Obj2/b.fits"), b"yy").unwrap();
-        let dirs = list_staging_dirs(&root);
-        assert_eq!(dirs.len(), 2, "only object dirs, no telescope roll-up: {dirs:?}");
+        let dirs = list_review_dirs(&roots(&[&root]), 100);
+        assert_eq!(dirs.len(), 2, "only dirs holding frames: {dirs:?}");
         assert!(dirs.iter().all(|d| d.frames == 1), "{dirs:?}");
-        assert!(dirs.iter().all(|d| d.telescope == "Pier"));
+        let rn = root.file_name().unwrap().to_string_lossy().to_string();
+        assert!(dirs.iter().all(|d| d.label.starts_with(&format!("{rn}/Pier/"))), "{dirs:?}");
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// A cap must be per root: a CCD tree with hundreds of directories must
+    /// not push the staging directories out of the list entirely.
+    #[test]
+    fn every_root_stays_visible_when_one_root_is_huge() {
+        let big = tmpdir("bigroot");
+        let small = tmpdir("smallroot");
+        for i in 0..5 {
+            fs::create_dir_all(big.join(format!("81GT/Obj{i}"))).unwrap();
+            fs::write(big.join(format!("81GT/Obj{i}/a.fits")), b"x").unwrap();
+        }
+        fs::create_dir_all(small.join("Pier/Target")).unwrap();
+        fs::write(small.join("Pier/Target/a.fits"), b"x").unwrap();
+
+        let dirs = list_review_dirs(&roots(&[&big, &small]), 2);
+        let labels: Vec<String> = dirs.iter().map(|d| d.label.clone()).collect();
+        let bn = big.file_name().unwrap().to_string_lossy().to_string();
+        let sn = small.file_name().unwrap().to_string_lossy().to_string();
+        assert!(labels.iter().any(|l| l.starts_with(&format!("{bn}/"))), "{labels:?}");
+        assert!(
+            labels.iter().any(|l| l.starts_with(&format!("{sn}/"))),
+            "second root crowded out: {labels:?}"
+        );
+        fs::remove_dir_all(&big).ok();
+        fs::remove_dir_all(&small).ok();
+    }
+
+    #[test]
+    fn destinations_cover_every_root_and_label_by_root() {
+        let a = tmpdir("dest_a");
+        let b = tmpdir("dest_b");
+        fs::create_dir_all(a.join("81GT/M42")).unwrap();
+        fs::create_dir_all(b.join("Pier/Jacoby1")).unwrap();
+        let ds = list_destinations(&roots(&[&a, &b]), 100);
+        let labels: Vec<&str> = ds.iter().map(|d| d.label.as_str()).collect();
+        let an = a.file_name().unwrap().to_string_lossy().to_string();
+        let bn = b.file_name().unwrap().to_string_lossy().to_string();
+        assert!(labels.contains(&format!("{an}/81GT/M42").as_str()), "{labels:?}");
+        assert!(labels.contains(&format!("{bn}/Pier/Jacoby1").as_str()), "{labels:?}");
+        assert!(labels.contains(&an.as_str()), "the root itself is a destination");
+        // Labels sort, so the dropdown is stable.
+        let mut sorted = labels.clone();
+        sorted.sort();
+        assert_eq!(labels, sorted, "destinations must be sorted by label");
+        fs::remove_dir_all(&a).ok();
+        fs::remove_dir_all(&b).ok();
     }
 
     #[test]
@@ -825,7 +1082,7 @@ mod tests {
         s.push_str(&" ".repeat(80 - s.len()));
         hdr.push_str(&s);
         hdr.push_str(&format!("{:<80}", "END"));
-        while hdr.len() % 2880 != 0 {
+        while !hdr.len().is_multiple_of(2880) {
             hdr.push_str(&format!("{:<80}", ""));
         }
         let mut bytes = hdr.into_bytes();
@@ -838,7 +1095,7 @@ mod tests {
                 bytes.extend_from_slice(&v.to_be_bytes());
             }
         }
-        while bytes.len() % 2880 != 0 {
+        while !bytes.len().is_multiple_of(2880) {
             bytes.extend_from_slice(&[0u8; 8]);
         }
         fs::write(path, &bytes).unwrap();

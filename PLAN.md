@@ -3,9 +3,14 @@
 ## Summary
 Add a **staging review workflow** to the active Rust/axum server (`src/`): a config file declares the CCD repository root, a staging area, and a cache area; the user picks **one staging object directory** (input) and **one `CCD/<telescope>/<object>` directory** (output), browses the input's images in a keyboard-driven slideshow grouped by filter and sorted by a free noise-based quality metric, with auto-stretched FITS previews that have a native 1:1 200×200 detail inset baked in, marks images for **push** (move to the chosen output dir) or **delete**, and a final summary page applies all marks in one batch — then purges the previews it just made.
 
-**Status: implemented, tested (49 unit tests), and running on `:5000`.** This document now describes the
+**Status: implemented, tested (61 unit tests), and running on `:5000`.** This document now describes the
 as-built system. Sections that changed during implementation are marked **⚠ as-built**; the measured
 baseline in §0 is unchanged because none of it was invalidated.
+
+**⚠ as-built — the staging screen is now a *generic review screen* (§9).** `src/staging.rs` is
+`src/review.rs`, the routes are `/review*`, marks are opt-in, and the actions are move / copy /
+symlink / delete on **any** directory under a configured root. §3, §4, §5 and §6 below describe the
+original staging-only design and are superseded where they conflict with §9.
 
 ## 0. Measured baseline (from real data)
 
@@ -59,6 +64,7 @@ Every design decision below is grounded in measurements against the actual corpu
 - **A typo'd `--config` path is a hard error**, not a silent fall back to defaults.
 - **⚠ as-built — `--port` flag added** (default `5000`) so a test instance can run without killing production.
 - `AppState` gains `staging: PathBuf` and `cache: PathBuf`. Note the constructor **already takes 5 args** (`root, page_size, longitude, latitude, compendium_dir`) after the concurrent Compendium work, so this touches more of `main.rs` than it looks.
+- **⚠ as-built — two more config keys** (§9): `nav_repeat_ms` (autorepeat throttle, default **500**, CLI `--nav-repeat-ms`) and `review_roots` (extra directories the generic review screen may open, CLI `--review-roots` as a comma-separated list). Review roots are **validated at startup**: a root that does not exist is a hard error, not a silently ignored entry.
 
 ## 2. FITS preview renderer (new module `src/fits_preview.rs`)
 
@@ -125,6 +131,10 @@ Every design decision below is grounded in measurements against the actual corpu
 
 ## 3. New routes (`src/server.rs`)
 
+**⚠ as-built — all routes below are `/review*`** (`/review`, `/review/manifest`, `/review/preview`,
+`/review/destinations`, `/review/destfiles`, `/review/newdest`, `/review/apply`); `/staging` survives
+as a launcher that lists staging dirs and links into `/review?dir=`. See §9 for the current shape.
+
 | Route | Behavior |
 |---|---|
 | `GET /staging` | **Two-level browse**: telescope dirs → object dirs. Object dirs are the selectable unit. Dirs with 0 images filtered out. **Calibration dirs (`Darks`/`Flats`/`DarksGood`) are shown** — they are reviewable and importable. `.git`, `.stfolder`, and all dot-dirs skipped. **All four columns (`Object`/`Telescope`/`Frames`/`Size`) are sortable** — client-side, keyed off raw `data-bytes`/`data-frames` numbers because ordering by the display string puts `4.1 kB` below `64 B`; counts and sizes open high-first, names A→Z. Link added to the index page header. |
@@ -155,6 +165,10 @@ Every design decision below is grounded in measurements against the actual corpu
 
 ## 4. Slideshow UI (`src/render.rs`, embedded HTML/JS)
 
+**⚠ as-built — the mark model is inverted** (mark = act, `Space` toggles, `A`/`N`/`I` mark all /
+none / invert) and the action is chosen from an op select. See §9; the `Space` = skip / `z` = delete
+rows below are superseded.
+
 - **Single page: JS swaps `<img src>`.** No per-image server navigation — otherwise in-memory mark state dies on every arrow press.
 - Large centered image (fit to window), filename + index counter (e.g. `7 / 134`), current mark badge (PUSH → dest / DELETE / none). The 1:1 detail inset is already inside that image.
 - **Grouping:** images grouped by `(IMAGETYP, FILTER)` with group headers, e.g. `Light · H (263)`. Prefer header values (`FILTER`, `IMAGETYP`) over the filename regex; fall back to `parse_filter` (`RE_FILTER = _([LRBGSOH])_`) and `FILTERS`/`filter_label` from `traverse.rs` for consistency. Navigation walks within a group or across all.
@@ -181,6 +195,8 @@ Every design decision below is grounded in measurements against the actual corpu
 
 ## 5. Behaviour changes / additions
 - Index page gains a "Review staging" link; everything else unchanged.
+  - **⚠ as-built — every object row on `/` carries a `Review` button** (`window.open('/review?dir=<abs>')`),
+    and the header links `/review`. See §9.
   - Note: `index()` passes `flashes = String::new()` (`server.rs:218`), so post-apply feedback cannot appear on `/`.
 - New Rust dependencies: `image` (`default-features = false, features = ["jpeg"]` — it is **not** in `Cargo.lock` today, so the build needs network) and `rayon`.
 - Nothing derived is ever written inside the staging tree (Syncthing shares).
@@ -202,7 +218,7 @@ Every design decision below is grounded in measurements against the actual corpu
 - **Concurrent work in this repo:** an unrelated Compendium feature (`calamine`/`zip`/`quick-xml` deps, `src/compendium.rs`, `src/lib.rs`, `/compendium*` routes, `--compendium-dir`/`--latitude`) is in flight on the same files this plan touches — `main.rs`, `server.rs`, `render.rs`, `Cargo.toml`. Expect merge friction; re-check the line anchors in this document before implementing.
 
 ## 7. Testing & verification
-- **Unit tests (`cargo test`)** — **54 pass as built** (24 lib + 28 bin + 2 compendium). No HTTP-level tests, so no `tower` dev-dependency is needed (the crate has zero dev-deps today):
+- **Unit tests (`cargo test`)** — **61 pass as built** (24 lib + 35 bin + 2 compendium). No HTTP-level tests, so no `tower` dev-dependency is needed (the crate has zero dev-deps today):
   - FITS round-trip on synthetic files written in-test: BITPIX 16 mono, −32 RGB, BINTABLE-skip, truncated-file error.
   - **`BZERO = 32768` round-trip asserting the sky median stays positive** (guards the single most important line in the reader).
   - **Block-padding test:** a synthetic file with trailing 2880-boundary filler reads exactly `NAXIS1×NAXIS2` pixels, with no garbage appended.
@@ -211,8 +227,10 @@ Every design decision below is grounded in measurements against the actual corpu
   - Stretch sanity: background near-black, bright star near-white, midtone median ≈ 0.30; and the `max(med+8σ, p99.99)` guard on a synthetic dataset shaped like the real Ha data (sky ~310, σ ~12, saturated stars).
   - `sky/σ` ordering test, and grouping by `(IMAGETYP, FILTER)`.
   - **Inset anchor tests:** picks a real star over the geometric centre; skips saturated peaks; **rejects a lone hot pixel**; **rejects a 2×2 hot cluster**; returns the **flux centroid** rather than the highest pixel; keeps an unsaturated star sharing a block with a saturated one; and **prefers a star over a higher-peak cosmic ray** (the real-data regression).
-  - **`render_staging_index` tests:** every column exposes a `data-key`, rows carry raw `data-bytes`/`data-frames` next to human-readable display text, and the empty case still renders sortable headers.
-  - **Staging listing guards:** dot-directories (`.stfolder`, `.config`, `.syncthing.*`) are never offered; telescope-level rows must not double-count their object dirs.
+  - **`render_review_index` tests:** every column exposes a `data-key`, rows carry raw `data-bytes`/`data-frames` next to human-readable display text, and the empty case still renders sortable headers.
+  - **`render_review` tests:** the configured `nav_repeat_ms` reaches the page (`data-repeat`, the hint text, and no unsubstituted placeholder), all four operations are offered, and every mark gesture (`Space`/`A`/`N`/`I`/`U`) is bound; the confirmation string carries operation + quantity.
+  - **Review listing guards:** dot-directories (`.stfolder`, `.config`, `.syncthing.*`) are never offered; telescope-level rows must not double-count their object dirs; **the cap is per root** so a huge first root cannot crowd a second root out of the list; destinations cover every root and are labelled root-relative.
+  - **Apply-op tests:** move, copy, symlink (absolute target), delete; **clobber refusal** for all three write ops; destination must exist and must be inside a root; sources must resolve inside the reviewed dir; `delete` needs no destination.
   - **`create_object` tests:** creates the dir and writes `plan.md` (with and without front matter); rejects `..`, `.`, `/`, `\`, NUL and blank names; rejects a telescope that is not a directory or contains a separator; refuses to adopt an existing directory; and creates nothing at all when a name is rejected.
   - Path-guard helper unit test: escape via `..`, absolute paths, symlink escape → rejected.
 - **Manual scenarios:**
@@ -231,10 +249,12 @@ Every design decision below is grounded in measurements against the actual corpu
   13. Path traversal attempts (`?dir=../`, absolute paths) return 404.
   14. Nothing new appears inside the staging tree after browsing (Syncthing safety).
   15. Create a destination from the review page, then push into it in the same session.
+- **⚠ as-built — the generic screen was verified end-to-end on a throwaway fixture** (`--config /tmp/rev_config.json --port 5055`, never production): move, copy, symlink, delete, clobber refusal, missing destination (message points at `＋ new destination`), source escape and destination escape (`400`), cross-root move, `newdest` creation + `plan.md`, and `--review-roots` / `--nav-repeat-ms` overrides (including the hard startup error when a review root does not exist). Both embedded JS scripts pass `node --check`.
 - **⚠ as-built — `newdest` verified end-to-end on a throwaway instance** (`--root /tmp/e2e_ccd --port 5055`, never production): created `81GT/Jacoby1` + `plan.md`, appeared in `/staging/destinations`, and a push moved a file into it. All seven hostile payloads (`../RC`, `a/b`, `..`, blank, a telescope containing `/`, a nonexistent telescope, a duplicate) returned `400` and left the tree unchanged. Bug caught by the unit tests: `resolve_within` canonicalizes the **parent**, so passing a relative `<tel>/<name>` candidate resolved against the process CWD instead of the CCD root — the candidate must be absolute.
 - **⚠ as-built — verified against live data** (`/ssd/sync`, `Pier/Jacoby1` 740 frames / 15.7 GB): cold manifest **3.95 s**, warm **13 ms**; cold preview **268 ms**, warm **19 ms**; grouping correct as `Light·Ha (621)` + `Light·Luminance (119)`. Push moved the file and refused a collision without clobbering; delete removed the source permanently; the manifest drained and the preview cache purged (3 → 1 → 0). `find /ssd/sync -newermt '-10 minutes' -type f` stayed empty. Bugs found and fixed this way: telescope rows double-counting object dirs, dot-dirs offered as telescopes, `&` in a directory name truncating the `dir=` query, and the cache purge not firing because the manifest was not loaded before the key snapshot.
 
 ## 8. Deferred — measured, if revisited
+
 Recorded so the numbers are on the record and re-deciding does not require re-measuring.
 
 | Feature | Measured cost | Why deferred |
@@ -246,3 +266,62 @@ Recorded so the numbers are on the record and re-deciding does not require re-me
 | **Cache eviction** for browsed-but-never-applied dirs | — | Apply-time purge covers the normal workflow |
 | **RAW (CR2/CR3) previews** | CCD holds 2,625 CR3 + 711 CR2; staging holds none | No decoder; files remain markable |
 | **`.xisf` previews** | masters up to 943 MB | Only in `CCD/*/master/`, never in staging |
+
+## 9. Generic review screen (as-built)
+
+The staging workflow was generalised: the same screen now reviews **any** directory, so a CCD object
+dir, a calibration dir, and a staging dir are all handled by one code path with one mark model.
+
+**Module:** `src/staging.rs` → `src/review.rs` (`git mv`, history preserved). Exports `Op` (Move /
+Copy / Symlink / Delete), `ApplyReport`, `ReviewDir`, `Destination`, `resolve_within`,
+`resolve_within_any`, `list_review_dirs`, `list_destinations`, `list_dir_files`, `scan`, `apply`.
+
+**Roots.** The reviewable set is `CCD root + staging + review_roots` (config array, CLI
+`--review-roots`). Every path in every endpoint is validated against that set:
+- sources must resolve inside the **reviewed directory** (`resolve_within`);
+- destinations must resolve inside **any root** and must already exist (`resolve_within_any`);
+- previews are served for any root, not only the CCD root.
+
+**Routes** (`/review*`): `GET /review` (directory listing across all roots), `GET /review?dir=` (the
+screen), `GET /review/manifest`, `GET /review/preview`, `GET /review/destinations`,
+`GET /review/destfiles`, `POST /review/newdest`, `POST /review/apply`. `/staging` stays as a launcher.
+
+**Mark model (inverted from §4).** Marks are **opt-in**: a marked file is the file the action applies
+to. `Space` toggles the current frame and advances; `A` marks all, `N` unmarks all, `I` inverts, `U`
+unmarks the current frame. `localStorage` key is `marks4:<dir>` and stores **marked** paths only.
+
+**Actions.** Four action buttons in the bar (`Move` / `Copy` / `Symlink` / `Delete`) plus one
+destination select. Pressing a button states the operation (the pressed button stays highlighted,
+`Delete` is red) and opens the confirmation; `Move` is the default and `Delete` disables the
+destination select.
+- `move` — `rename` with a cross-filesystem copy+delete fallback.
+- `copy` — `fs::copy` + `fsync` of the destination.
+- `symlink` — **absolute** source path as the link target (a relative target would be wrong the moment
+  the link is moved, and Syncthing does move links).
+- `delete` — permanent `remove_file`; needs no destination.
+- Every op **refuses to overwrite** an existing name at the destination and reports it as a failure;
+  `apply` never creates a destination directory.
+
+**Confirmation states the operation and the quantity.** The summary shows
+`Move 12 of 740 file(s) → dest`, lists the marked files (first 200), flags name collisions, and warns
+on deletes. The Apply button is two-step armed and repeats the operation, the count, and the
+destination on the confirm press.
+
+**Autorepeat is configurable.** `nav_repeat_ms` (config) / `--nav-repeat-ms` (CLI), default **500 ms**,
+is injected into the page as `data-repeat` and used as the throttle for the arrow/`h`/`l` keys. Only
+nav keys honour `e.repeat`; `Space`, `A`, `N`, `I`, `U` keep the guard so marks can never machine-gun.
+
+**Listing.** `/review` lists every directory under any root that holds FITS files **directly**
+(nested dirs are not double-counted), labelled root-relative (`CCD/102CF/M8`), with frames and bytes
+sortable by raw numbers. The cap is **per root** — a 400-directory CCD tree must not crowd the staging
+dirs out of the list (measured: 400 CCD + 14 staging rows on real data). Dot-dirs (`.stfolder`, `.git`)
+are never offered. **FITS-only** for now: non-FITS files are not listed.
+
+**Index integration.** Every object row on `/` gains a `Review` button; the review URL uses `DIR_QUERY`
+so `/` stays readable in the query string.
+
+**Verified against real data** (`:5057` with the production config): roots reported as
+`/data/Astro/CCD, /ssd/sync (autorepeat 500 ms)`; 414 directories listed; `Esprit/LBN458` manifest
+(101 frames) and preview (20 KB JPEG) served; cross-root move, symlink, delete, clobber refusal,
+missing-destination, and path-escape (`400`) all exercised on a temp fixture; both embedded JS
+scripts pass `node --check`.

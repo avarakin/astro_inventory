@@ -4,7 +4,7 @@ mod location;
 mod plan;
 mod server;
 mod render;
-mod staging;
+mod review;
 
 use std::path::PathBuf;
 
@@ -23,9 +23,18 @@ struct Cli {
     #[arg(long)]
     root: Option<std::path::PathBuf>,
 
-    /// Staging directory reviewed at /staging (enables the feature)
+    /// Staging directory, listed as a launcher on /staging
     #[arg(long)]
     staging: Option<std::path::PathBuf>,
+
+    /// Extra directories the generic review screen may open (in addition to
+    /// the CCD root and the staging dir)
+    #[arg(long, value_delimiter = ',')]
+    review_roots: Vec<std::path::PathBuf>,
+
+    /// Autorepeat throttle for the review screen's arrow keys, in ms
+    #[arg(long)]
+    nav_repeat_ms: Option<u64>,
 
     /// Where rendered preview JPEGs are cached. Must live OUTSIDE the staging
     /// tree: every staging telescope dir is a Syncthing folder, so anything
@@ -63,6 +72,8 @@ struct Config {
     compendium_dir: Option<PathBuf>,
     latitude: Option<f64>,
     longitude: Option<f64>,
+    review_roots: Option<Vec<PathBuf>>,
+    nav_repeat_ms: Option<u64>,
 }
 
 /// Precedence: CLI flag > config file > built-in default.
@@ -117,6 +128,24 @@ fn main() -> anyhow::Result<()> {
     let cache_dir = pick(cli.cache, cfg.cache, default_cache_dir());
     let page_size = pick(cli.page_size, cfg.page_size, 20);
     let compendium_dir = pick(cli.compendium_dir, cfg.compendium_dir, PathBuf::from("data/compendium"));
+    // 500 ms is the default: a held arrow scrolls at two frames per second,
+    // which stays under the ~270 ms cold preview render.
+    let nav_repeat_ms = pick(cli.nav_repeat_ms, cfg.nav_repeat_ms, 500);
+    // The CCD root and staging are always reviewable; config/CLI add more.
+    let mut review_roots: Vec<PathBuf> = cli.review_roots;
+    for r in cfg.review_roots.unwrap_or_default() {
+        if !review_roots.contains(&r) {
+            review_roots.push(r);
+        }
+    }
+    if !review_roots.contains(&root) {
+        review_roots.push(root.clone());
+    }
+    if let Some(s) = &staging {
+        if !review_roots.contains(s) {
+            review_roots.push(s.clone());
+        }
+    }
 
     // Detect location BEFORE starting the tokio runtime (reqwest::blocking
     // panics when called from inside an async context).
@@ -129,9 +158,21 @@ fn main() -> anyhow::Result<()> {
         if !s.is_dir() {
             anyhow::bail!("staging directory does not exist: {}", s.display());
         }
-        std::fs::create_dir_all(&cache_dir)?;
-        println!("Staging review enabled: {} (preview cache: {})", s.display(), cache_dir.display());
     }
+    let missing: Vec<PathBuf> = review_roots.iter().filter(|r| !r.is_dir()).cloned().collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "review root(s) do not exist: {}",
+            missing.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    std::fs::create_dir_all(&cache_dir)?;
+    println!(
+        "Review roots: {} (autorepeat {} ms, preview cache: {})",
+        review_roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
+        nav_repeat_ms,
+        cache_dir.display()
+    );
 
     let state = server::AppState::new(
         root,
@@ -141,6 +182,8 @@ fn main() -> anyhow::Result<()> {
         compendium_dir,
         staging,
         cache_dir,
+        review_roots,
+        nav_repeat_ms,
     );
 
     let app = server::build_app(state);
@@ -189,6 +232,16 @@ mod tests {
         fs::write(&p, "{}").unwrap();
         assert_eq!(config_path_in(&d, Some(&p)).unwrap(), Some(p));
         fs::remove_dir_all(&d).ok();
+    }
+
+    /// Autorepeat is config-driven: 500 ms is the built-in default, a config
+    /// value overrides it, and a CLI flag overrides the config.
+    #[test]
+    fn nav_repeat_ms_is_cli_over_config_over_default() {
+        use super::pick;
+        assert_eq!(pick(None, None, 500u64), 500);
+        assert_eq!(pick(None, Some(120), 500), 120);
+        assert_eq!(pick(Some(800), Some(120), 500), 800);
     }
 
     #[test]

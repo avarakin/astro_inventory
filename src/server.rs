@@ -10,15 +10,15 @@ use axum::routing::{get, post};
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use axum::{extract::Form, Router};
 use chrono::Local;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::Semaphore;
 use crate::plan::expand_constellation;
 use crate::render::{
     col_by_key, page_size_control, render_edit_page, render_header_cells, render_index_page,
-    render_pager, render_staging_index, render_staging_review, sort_records,
+    render_pager, render_review, render_review_index, sort_records,
 };
 use crate::traverse::{build_row, traverse, ObjectRecord};
-use crate::staging::{self, Manifest, PreviewCache};
+use crate::review::{self, Manifest, PreviewCache};
 use astro_inventory::compendium;
 
 /// Shared application state.
@@ -29,11 +29,19 @@ pub struct AppState {
     pub latitude: f64,
     pub compendium_dir: PathBuf,
     cache: Mutex<ScanCache>,
-    /// `None` disables the whole staging review feature.
+    /// `None` disables the staging launcher page.
     pub staging_root: Option<PathBuf>,
+    /// Directories the generic review screen may open. Every client path is
+    /// validated against this set before touching the filesystem.
+    pub review_roots: Vec<PathBuf>,
+    /// Autorepeat throttle for the review screen's arrow keys, in ms.
+    pub nav_repeat_ms: u64,
     previews: Option<PreviewCache>,
-    /// Parsed manifests keyed by canonical staging directory.
+    /// Parsed manifests keyed by canonical reviewed directory.
     manifests: Mutex<HashMap<String, Manifest>>,
+    /// Walked destination list. Rebuilt after anything that can add a directory
+    /// (apply, newdest) — a full walk of ~1,900 dirs measured 1.05 s.
+    dests: Mutex<Option<Vec<review::Destination>>>,
     /// Serializes full FITS decodes: each one saturates rayon for ~250 ms.
     render_permits: Semaphore,
 }
@@ -54,10 +62,10 @@ impl AppState {
         compendium_dir: PathBuf,
         staging_root: Option<PathBuf>,
         cache_dir: PathBuf,
+        review_roots: Vec<PathBuf>,
+        nav_repeat_ms: u64,
     ) -> Arc<Self> {
-        let previews = staging_root
-            .as_ref()
-            .map(|_| PreviewCache::new(cache_dir));
+        let previews = Some(PreviewCache::new(cache_dir));
         Arc::new(Self {
             root,
             page_size_default: page_size,
@@ -70,31 +78,39 @@ impl AppState {
                 root_mtime: 0.0,
             }),
             staging_root,
+            review_roots,
+            nav_repeat_ms,
             previews,
             manifests: Mutex::new(HashMap::new()),
+            dests: Mutex::new(None),
             render_permits: Semaphore::new(1),
         })
     }
 
-    /// Resolve a client-supplied path, refusing anything outside the staging
-    /// root. Every staging route goes through this first.
-    fn staging_path(&self, raw: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
-        let sr = self
-            .staging_root
-            .as_ref()
-            .ok_or((StatusCode::NOT_FOUND, "staging review is not enabled".to_string()))?;
-        staging::resolve_within(sr, raw).map_err(|e| (StatusCode::BAD_REQUEST, e))
+    /// Resolve a client-supplied path, refusing anything outside the allowed
+    /// review roots. Every review route goes through this first.
+    fn review_path(&self, raw: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+        review::resolve_within_any(&self.review_roots, raw).map_err(|e| (StatusCode::BAD_REQUEST, e))
     }
 
-    /// Resolve a client-supplied path that must stay inside the CCD root.
-    fn ccd_path(&self, raw: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
-        staging::resolve_within(&self.root, raw).map_err(|e| (StatusCode::BAD_REQUEST, e))
+    fn cached_dests(&self) -> Option<Vec<review::Destination>> {
+        self.dests.lock().unwrap().clone()
+    }
+
+    fn set_dests(&self, dirs: Vec<review::Destination>) {
+        *self.dests.lock().unwrap() = Some(dirs);
+    }
+
+    /// A destination list is only stale once a directory can appear; a file
+    /// move does not change it.
+    fn invalidate_dests(&self) {
+        *self.dests.lock().unwrap() = None;
     }
 
     /// Return a manifest for `dir`, rescanning only when the file set changed.
     fn manifest_for(&self, dir: &std::path::Path) -> Manifest {
         let key = dir.to_string_lossy().to_string();
-        let sig = staging::dir_signature(dir, &staging::list_images(dir));
+        let sig = review::dir_signature(dir, &review::list_images(dir));
         {
             let cache = self.manifests.lock().unwrap();
             if let Some(m) = cache.get(&key) {
@@ -103,7 +119,7 @@ impl AppState {
                 }
             }
         }
-        let m = staging::scan(dir);
+        let m = review::scan(dir);
         self.manifests.lock().unwrap().insert(key, m.clone());
         m
     }
@@ -198,13 +214,13 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/compendium/data", get(compendium_data))
         .route("/compendium/thumb/{id}", get(compendium_thumb))
         .route("/staging", get(staging_index))
-        .route("/staging/review", get(staging_review))
-        .route("/staging/manifest", get(staging_manifest))
-        .route("/staging/preview", get(staging_preview))
-        .route("/staging/destinations", get(staging_destinations))
-        .route("/staging/destfiles", get(staging_destfiles))
-        .route("/staging/newdest", post(staging_newdest))
-        .route("/staging/apply", post(staging_apply))
+        .route("/review", get(review))
+        .route("/review/manifest", get(review_manifest))
+        .route("/review/preview", get(review_preview))
+        .route("/review/destinations", get(review_destinations))
+        .route("/review/destfiles", get(review_destfiles))
+        .route("/review/newdest", post(review_newdest))
+        .route("/review/apply", post(review_apply))
         .with_state(state)
 }
 
@@ -293,7 +309,15 @@ async fn index(
                     format!("/delete/{}/{}", tel, name),
                 )
             };
-            build_row(rec, &image_url_fn, &actions_url_fn)
+            // Every object directory is reviewable: the screen is generic, so
+            // a CCD dir opens with the same marks and actions as a staging dir.
+            let review_url_fn = |path: &std::path::Path| -> String {
+                let s = path.to_string_lossy();
+                // DIR_QUERY keeps `/` readable: a plain `dir=/a/b` is easier to
+                // read, bookmark, and debug than `dir=%2Fa%2F%2Fb`.
+                format!("/review?dir={}", percent_encode(s.as_bytes(), crate::render::DIR_QUERY))
+            };
+            build_row(rec, &image_url_fn, &actions_url_fn, &review_url_fn)
         })
         .collect();
 
@@ -330,9 +354,9 @@ async fn index(
         &rows.join("\n"),
         &pager,
         if state.staging_root.is_some() {
-            " &middot; <a href=\"/staging\">Review staging</a>"
+            " &middot; <a href=\"/review\">Review directories</a> &middot; <a href=\"/staging\">Staging</a>"
         } else {
-            ""
+            " &middot; <a href=\"/review\">Review directories</a>"
         },
     );
 
@@ -454,7 +478,7 @@ fn create_object(
     // parent would be resolved against the process CWD, not the root.
     let root_real = std::fs::canonicalize(root).map_err(|e| format!("CCD root: {e}"))?;
     let obj_dir =
-        staging::resolve_within(&root_real, &root_real.join(telescope).join(name).to_string_lossy())?;
+        review::resolve_within(&root_real, &root_real.join(telescope).join(name).to_string_lossy())?;
     if obj_dir.exists() {
         return Err(format!(
             "Object directory already exists: {telescope}/{name}"
@@ -536,10 +560,10 @@ struct NewDestRequest {
 /// `apply` deliberately still never creates directories: creating one is an
 /// explicit, visible action, so a typo in a batch cannot quietly scatter files
 /// into a fresh directory.
-async fn staging_newdest(
+async fn review_newdest(
     State(state): State<Arc<AppState>>,
     Json(req): Json<NewDestRequest>,
-) -> Result<Json<staging::Destination>, (StatusCode, String)> {
+) -> Result<Json<review::Destination>, (StatusCode, String)> {
     let telescope = req.telescope.trim().to_string();
     let name = req.name.trim().to_string();
     let st = state.clone();
@@ -553,9 +577,18 @@ async fn staging_newdest(
 
     // A new object dir under the CCD root is invisible to root_mtime().
     state.cache.lock().unwrap().records = None;
+    state.invalidate_dests();
 
-    Ok(Json(staging::Destination {
-        label: format!("{telescope}/{name}"),
+    // Label exactly as `list_destinations` does (`root/telescope/object`), so
+    // the JS can select the new option by path without a label mismatch.
+    let root_name = state
+        .root
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    Ok(Json(review::Destination {
+        label: format!("{root_name}/{telescope}/{name}"),
         name,
         path: created.to_string_lossy().into_owned(),
     }))
@@ -872,10 +905,10 @@ fn redirect_with_flash(cat: &str, msg: &str) -> Response {
     (StatusCode::SEE_OTHER, headers).into_response()
 }
 
-// --- Staging review routes ---
+// --- Review routes ---
 
 #[derive(Deserialize)]
-struct StagingQuery {
+struct ReviewQuery {
     dir: Option<String>,
 }
 
@@ -884,45 +917,60 @@ struct PreviewQuery {
     path: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct ApplyRequest {
     dir: String,
-    pushes: Vec<staging::PushItem>,
-    deletes: Vec<String>,
+    op: review::Op,
+    /// Destination directory. Required for move/copy/symlink, ignored for delete.
+    dst: Option<String>,
+    files: Vec<String>,
 }
 
+/// The staging launcher: directories under the staging root that hold frames.
 async fn staging_index(
     State(state): State<Arc<AppState>>,
 ) -> Result<Html<String>, (StatusCode, String)> {
     let sr = state
         .staging_root
         .clone()
-        .ok_or((StatusCode::NOT_FOUND, "staging review is not enabled".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "staging launcher is not enabled".to_string()))?;
     let sr2 = sr.clone();
-    let dirs = tokio::task::spawn_blocking(move || staging::list_staging_dirs(&sr2))
+    let dirs = tokio::task::spawn_blocking(move || review::list_review_dirs(&[sr2], 400))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Html(render_staging_index(&sr.to_string_lossy(), &dirs)))
+    Ok(Html(render_review_index(&[sr], &dirs)))
 }
 
-async fn staging_review(
+/// The generic review screen. With `?dir=` it opens that directory; without it
+/// it lists every directory under the review roots that holds frames.
+async fn review(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<StagingQuery>,
+    Query(q): Query<ReviewQuery>,
 ) -> Result<Html<String>, (StatusCode, String)> {
-    let raw = q.dir.ok_or((StatusCode::BAD_REQUEST, "dir is required".to_string()))?;
-    let dir = state.staging_path(&raw)?;
+    let raw = q.dir.filter(|d| !d.is_empty());
+    let raw = match raw {
+        Some(r) => r,
+        None => {
+            let roots = state.review_roots.clone();
+            let dirs = tokio::task::spawn_blocking(move || review::list_review_dirs(&roots, 400))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            return Ok(Html(render_review_index(&state.review_roots, &dirs)));
+        }
+    };
+    let dir = state.review_path(&raw)?;
     if !dir.is_dir() {
         return Err((StatusCode::NOT_FOUND, "not a directory".to_string()));
     }
-    Ok(Html(render_staging_review(&dir.to_string_lossy())))
+    Ok(Html(render_review(&dir.to_string_lossy(), state.nav_repeat_ms)))
 }
 
-async fn staging_manifest(
+async fn review_manifest(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<StagingQuery>,
+    Query(q): Query<ReviewQuery>,
 ) -> Result<Json<Manifest>, (StatusCode, String)> {
     let raw = q.dir.ok_or((StatusCode::BAD_REQUEST, "dir is required".to_string()))?;
-    let dir = state.staging_path(&raw)?;
+    let dir = state.review_path(&raw)?;
     if !dir.is_dir() {
         return Err((StatusCode::NOT_FOUND, "not a directory".to_string()));
     }
@@ -934,22 +982,22 @@ async fn staging_manifest(
     Ok(Json(m))
 }
 
-async fn staging_preview(
+async fn review_preview(
     State(state): State<Arc<AppState>>,
     Query(q): Query<PreviewQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     let raw = q.path.ok_or((StatusCode::BAD_REQUEST, "path is required".to_string()))?;
-    let path = state.staging_path(&raw)?;
+    let path = state.review_path(&raw)?;
     if !path.is_file() {
         return Err((StatusCode::NOT_FOUND, "not a file".to_string()));
     }
     let cache = state
         .previews
         .clone()
-        .ok_or((StatusCode::NOT_FOUND, "staging review is not enabled".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "preview cache is not configured".to_string()))?;
 
     let meta = std::fs::metadata(&path).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
-    let key = staging::preview_key(&path, &meta);
+    let key = review::preview_key(&path, &meta);
 
     // One decode at a time: each render uses every core for a few hundred ms.
     let _permit = state
@@ -973,51 +1021,65 @@ async fn staging_preview(
         .unwrap())
 }
 
-async fn staging_destinations(
+async fn review_destinations(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<staging::Destination>>, (StatusCode, String)> {
-    let root = state.root.clone();
-    // Two-level read_dir, deliberately NOT get_records(): that path takes a
-    // std Mutex across a traverse measured at ~48 s, which would stall every
+) -> Result<Json<Vec<review::Destination>>, (StatusCode, String)> {
+    let roots = state.review_roots.clone();
+    if let Some(cached) = state.cached_dests() {
+        return Ok(Json(cached));
+    }
+    // A bounded read_dir walk, deliberately NOT get_records(): that path takes
+    // a std Mutex across a traverse measured at ~48 s, which would stall every
     // other request.
-    let dirs = tokio::task::spawn_blocking(move || staging::list_destinations(&root))
+    let dirs = tokio::task::spawn_blocking(move || review::list_destinations(&roots, 2_000))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state.set_dests(dirs.clone());
     Ok(Json(dirs))
 }
 
 /// Filenames already in a destination, so the UI can flag collisions before
 /// anything is written.
-async fn staging_destfiles(
+async fn review_destfiles(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<StagingQuery>,
+    Query(q): Query<ReviewQuery>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
     let raw = q.dir.ok_or((StatusCode::BAD_REQUEST, "dir is required".to_string()))?;
-    let dir = state.ccd_path(&raw)?;
-    let files = tokio::task::spawn_blocking(move || staging::dest_files(&dir, 20_000))
+    let dir = state.review_path(&raw)?;
+    let files = tokio::task::spawn_blocking(move || review::dest_files(&dir, 20_000))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(files))
 }
 
-async fn staging_apply(
+async fn review_apply(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ApplyRequest>,
-) -> Result<Json<staging::ApplyReport>, (StatusCode, String)> {
-    let dir = state.staging_path(&req.dir)?;
+) -> Result<Json<review::ApplyReport>, (StatusCode, String)> {
+    let dir = state.review_path(&req.dir)?;
     if !dir.is_dir() {
         return Err((StatusCode::BAD_REQUEST, "dir is not a directory".to_string()));
     }
-    if req.pushes.is_empty() && req.deletes.is_empty() {
+    if req.files.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "nothing to do".to_string()));
     }
+    let op = req.op;
+    let dst = if op.needs_destination() {
+        let raw = req
+            .dst
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "a destination is required for this operation".to_string(),
+            ))?;
+        state.review_path(raw)?;
+        Some(raw.to_string())
+    } else {
+        None
+    };
 
-    let processed: Vec<String> = req
-        .pushes
-        .iter()
-        .map(|p| p.src.clone())
-        .chain(req.deletes.iter().cloned())
-        .collect();
+    let processed: Vec<String> = req.files.clone();
     let dir_key = dir.to_string_lossy().to_string();
 
     // Snapshot the cache keys first: after a move the source's stat is gone,
@@ -1026,9 +1088,10 @@ async fn staging_apply(
     state.manifest_for(&dir);
     let keys = state.snapshot_keys(&dir_key, &processed);
 
-    let st = state.clone();
+    let roots = state.review_roots.clone();
+    let files = processed.clone();
     let report = tokio::task::spawn_blocking(move || {
-        staging::apply(&dir, &st.root, &req.pushes, &req.deletes)
+        review::apply(&dir, &roots, op, dst.as_deref(), &files)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1038,11 +1101,14 @@ async fn staging_apply(
         p.drop_keys(&keys);
     }
 
-    // Pushes land in CCD/<tel>/<obj>, which bumps the *object* dir's mtime —
-    // root_mtime() only stats entries of the root, so the inventory cache
-    // cannot notice on its own. Every other mutator nulls it explicitly.
-    if report.pushed > 0 {
+    // Files landing in (or leaving) `CCD/<tel>/<obj>` bump the *object* dir's
+    // mtime only — root_mtime() stats entries of the root, so the inventory
+    // cache cannot notice on its own. Every other mutator nulls it explicitly.
+    if report.touched() > 0 {
         state.cache.lock().unwrap().records = None;
+        // A move into a directory created by `＋ new destination` must show up
+        // in the dropdown on the next page load.
+        state.invalidate_dests();
     }
 
     Ok(Json(report))

@@ -476,6 +476,7 @@ pub fn build_row(
     rec: &ObjectRecord,
     image_url_fn: &dyn Fn(&Path) -> String,
     actions_url_fn: &dyn Fn(&str, &str) -> (String, String),
+    review_url_fn: &dyn Fn(&Path) -> String,
 ) -> String {
     let total_sec = total_seconds(rec);
 
@@ -540,13 +541,16 @@ pub fn build_row(
 
     // Actions
     let (edit_url, delete_url) = actions_url_fn(&rec.telescope, &rec.object);
+    let review_url = review_url_fn(&rec.path);
     let obj_label = html_escape(&format!("{}/{}", rec.telescope, rec.object));
     let actions_html = format!(
         "<button class=\"btn btn-edit\" onclick=\"window.open('{}', '_blank')\">Edit plan</button> \
+         <button class=\"btn btn-edit\" onclick=\"window.open('{}', '_blank')\">Review</button> \
          <button class=\"btn btn-del\" \
          onclick=\"if(confirm('Delete {} and all its files? This cannot be undone.'))document.getElementById('del_0').submit();return false\">Delete directory</button> \
          <form id=\"del_0\" method=\"post\" action=\"{}\" style=\"display:none\"><input type=\"hidden\" name=\"confirm\" value=\"yes\"></form>",
         html_escape(&edit_url),
+        html_escape(&review_url),
         obj_label,
         html_escape(&delete_url)
     );
