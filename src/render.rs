@@ -751,6 +751,16 @@ function flat() {
 
 const src = (f) => "/review/preview?path=" + encodeURIComponent(f.path);
 
+// 4 px frame around the stage image in the colour of the filter the frame was
+// taken through: S purple, H red, O blue-green, L white, R yellow-red, G green,
+// B blue. `filter` is the label from `traverse::filter_label`; frames with no
+// filter letter arrive as "—" and get DSLR gray.
+const FILTER_BORDER = {
+  "SII": "#A020F0", "Ha": "#FF3030", "OIII": "#00E5CC", "Luminance": "#FFFFFF",
+  "Red": "#FFB000", "Green": "#30C050", "Blue": "#3070FF",
+};
+const borderFor = (f) => FILTER_BORDER[f.filter] || "#808080";
+
 function setBadge(m) {
   const b = $("badge");
   b.className = "badge " + (m ? "b-mark" : "b-none");
@@ -770,6 +780,7 @@ function show() {
   $("load").style.display = "none";
   $("img").style.display = "";
   $("img").src = src(f);
+  $("img").style.border = "4px solid " + borderFor(f);
   $("counter").textContent = (i + 1) + " / " + frames.length;
   $("grp").textContent = f.grp;
   setBadge(isMarked(f));
@@ -1167,5 +1178,32 @@ mod tests {
             "confirmation must state the operation and the quantity");
         assert!(html.contains("/review/apply"), "apply endpoint missing");
         assert!(html.contains("data-dir=\"/ssd/sync/Pier/Jacoby1\""), "dir not injected");
+    }
+
+    /// The stage image is framed in the colour of the filter it was shot
+    /// through. The map must cover every filter letter, the fallback must be
+    /// DSLR gray, and the frame must be applied when the current frame changes.
+    #[test]
+    fn review_page_frames_the_image_in_the_filter_colour() {
+        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        for (needle, label) in [
+            ("\"SII\": \"#A020F0\"", "SII purple"),
+            ("\"Ha\": \"#FF3030\"", "Ha red"),
+            ("\"OIII\": \"#00E5CC\"", "OIII blue-green"),
+            ("\"Luminance\": \"#FFFFFF\"", "Luminance white"),
+            ("\"Red\": \"#FFB000\"", "Red yellow-red"),
+            ("\"Green\": \"#30C050\"", "Green green"),
+            ("\"Blue\": \"#3070FF\"", "Blue blue"),
+        ] {
+            assert!(html.contains(needle), "{label} missing from the border map");
+        }
+        assert!(
+            html.contains("FILTER_BORDER[f.filter] || \"#808080\""),
+            "no-filter frames must fall back to DSLR gray"
+        );
+        assert!(
+            html.contains("$(\"img\").style.border = \"4px solid \" + borderFor(f);"),
+            "border must be applied on every frame change"
+        );
     }
 }
