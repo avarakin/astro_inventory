@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::traverse::{filter_label, parse_filter};
+use crate::traverse::{filter_label, parse_filter, parse_timestamp};
 use astro_inventory::fits_preview::{self, FitError, RenderOptions};
 
 /// Extensions treated as reviewable frames. Non-FITS files are not listed:
@@ -168,6 +168,31 @@ fn direct_image_bytes(dir: &Path) -> u64 {
         .filter_map(|p| fs::metadata(&p).ok())
         .map(|m| m.len())
         .sum()
+}
+
+/// Newest image **directly** in `dir`. The timestamp comes from the filename, the
+/// same convention as the inventory page's `Latest image` column; a name with no
+/// stamp falls back to the file's mtime, so a directory whose files are named
+/// without a timestamp still sorts by recency.
+fn direct_latest_image(dir: &Path) -> Option<i64> {
+    let Ok(entries) = fs::read_dir(dir) else { return None };
+    let mut best: Option<i64> = None;
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_file() || !is_image(&p) {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        let ts = parse_timestamp(&name).map(|d| d.timestamp()).or_else(|| {
+            fs::metadata(&p)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+        });
+        best = ts.map_or(best, |t| best.map_or(Some(t), |b| Some(t.max(b))));
+    }
+    best
 }
 
 /// Signature of a directory's file set. Cheap: one stat per file, no reads.
@@ -579,6 +604,9 @@ pub struct ReviewDir {
     pub label: String,
     pub frames: usize,
     pub bytes: u64,
+    /// Newest image in the directory, unix seconds. Filename timestamp, falling
+    /// back to mtime. `None` when nothing is stampable.
+    pub latest: Option<i64>,
 }
 
 /// Directories under `roots` that hold frames **directly**. Nested object dirs
@@ -619,6 +647,7 @@ pub fn list_review_dirs(roots: &[PathBuf], cap: usize) -> Vec<ReviewDir> {
                     label,
                     frames: n,
                     bytes: direct_image_bytes(&d),
+                    latest: direct_latest_image(&d),
                 });
             }
             if depth >= MAX_WALK_DEPTH {
@@ -731,6 +760,7 @@ pub fn dest_files(dir: &Path, cap: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Local, TimeZone};
 
     /// Builds a root list without `clone`-in-slice noise.
     fn roots(paths: &[&std::path::Path]) -> Vec<PathBuf> {
@@ -743,6 +773,38 @@ mod tests {
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// The index's `Latest image` column: the newest filename stamp wins, and a
+    /// directory whose names carry no stamp falls back to file mtime.
+    #[test]
+    fn review_dir_reports_the_newest_image_timestamp() {
+        let root = tmpdir("latest");
+        let obj = root.join("Pier/Obj");
+        fs::create_dir_all(&obj).unwrap();
+        fs::write(obj.join("a_20260815_054412.fits"), b"x").unwrap();
+        fs::write(obj.join("b_20260901_120000.fits"), b"x").unwrap();
+        fs::write(obj.join("c_20260701_010101.fits"), b"x").unwrap();
+
+        let dirs = list_review_dirs(&[root.clone()], 400);
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(
+            dirs[0].latest,
+            Some(
+                Local.with_ymd_and_hms(2026, 9, 1, 12, 0, 0)
+                    .unwrap()
+                    .timestamp()
+            ),
+            "the newest filename stamp must win"
+        );
+
+        let plain = root.join("Pier/Plain");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("nope.fits"), b"x").unwrap();
+        let dirs = list_review_dirs(&[root.clone()], 400);
+        let plain_dir = dirs.iter().find(|d| d.label.ends_with("Plain")).unwrap();
+        assert!(plain_dir.latest.is_some(), "mtime fallback must produce a stamp");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::plan::html_escape;
 use crate::traverse::ObjectRecord;
+use chrono::{Local, TimeZone};
 use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 /// Encodes a filesystem path for use as a query-string value: everything
@@ -484,17 +485,27 @@ pub fn render_edit_page(
 pub fn render_review_index(roots: &[std::path::PathBuf], dirs: &[crate::review::ReviewDir]) -> String {
     let mut rows = String::new();
     if dirs.is_empty() {
-        rows = r#"<tr><td colspan="3" class="meta">No directories containing FITS frames.</td></tr>"#.to_string();
+        rows = r#"<tr><td colspan="4" class="meta">No directories containing FITS frames.</td></tr>"#.to_string();
     }
     for d in dirs {
         // Percent-encode for the query string (see DIR_QUERY).
         let q = percent_encode(d.path.as_bytes(), DIR_QUERY).to_string();
+        // Same display convention as the inventory page's `Latest image`.
+        let ts_disp = d.latest.and_then(|t| {
+            Local
+                .timestamp_opt(t, 0)
+                .single()
+                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        })
+        .unwrap_or_else(|| "\u{2014}".to_string());
         rows.push_str(&format!(
-            "<tr data-dir=\"{dirq}\" data-frames=\"{n}\" data-bytes=\"{bytes}\"><td><a href=\"/review?dir={q}\">{label}</a></td><td class=\"num\">{n}</td><td class=\"num\">{sz}</td></tr>\n",
+            "<tr data-dir=\"{dirq}\" data-frames=\"{n}\" data-ts=\"{ts}\" data-bytes=\"{bytes}\"><td><a href=\"/review?dir={q}\">{label}</a></td><td class=\"num\">{n}</td><td class=\"num\">{ts_disp}</td><td class=\"num\">{sz}</td></tr>\n",
             q = html_escape(&q),
             label = html_escape(&d.label),
             dirq = html_escape(&d.label),
             n = d.frames,
+            ts = d.latest.unwrap_or(0),
+            ts_disp = html_escape(&ts_disp),
             bytes = d.bytes,
             sz = human_bytes(d.bytes),
         ));
@@ -519,6 +530,7 @@ pub fn render_review_index(roots: &[std::path::PathBuf], dirs: &[crate::review::
 <thead><tr>
 <th class="sortable" data-key="dir">Directory<span class="arrow"></span></th>
 <th class="sortable num" data-key="frames">Frames<span class="arrow"></span></th>
+<th class="sortable num" data-key="latest">Latest image<span class="arrow"></span></th>
 <th class="sortable num" data-key="size">Size<span class="arrow"></span></th>
 </tr></thead>
 <tbody>
@@ -532,8 +544,9 @@ __ROWS__
 (function () {
   const tb = document.querySelector("#dirs tbody");
   const ths = Array.from(document.querySelectorAll("th.sortable"));
-  let key = "dir", dir = 1;
-  const NUM = { frames: "frames", size: "bytes" };
+  // Newest first: the point of the column is to find where the recent frames are.
+  let key = "latest", dir = -1;
+  const NUM = { frames: "frames", size: "bytes", latest: "ts" };
   function apply() {
     const rows = Array.from(tb.querySelectorAll("tr"));
     rows.sort((a, b) => {
@@ -1072,18 +1085,20 @@ mod tests {
                 label: "root/big".into(),
                 frames: 1,
                 bytes: 4096,
+                latest: Some(1762000000),
             },
             ReviewDir {
                 path: root.join("small").to_string_lossy().into_owned(),
                 label: "root/small".into(),
                 frames: 9,
                 bytes: 64,
+                latest: None,
             },
         ];
         let roots = [root.to_path_buf()];
         let html = render_review_index(&roots, &dirs);
 
-        for k in ["dir", "frames", "size"] {
+        for k in ["dir", "frames", "latest", "size"] {
             assert!(
                 html.contains(&format!("data-key=\"{k}\"")),
                 "column {k} must be sortable"
@@ -1093,6 +1108,25 @@ mod tests {
         assert!(html.contains("data-bytes=\"64\""), "raw total missing");
         assert!(html.contains("data-frames=\"9\""), "frame count key missing");
         assert!(html.contains("data-dir=\"root/big\""), "string sort key missing");
+        // The recency column sorts on raw unix seconds; an unstampable directory
+        // sorts as 0 (oldest), not as a string.
+        assert!(html.contains("data-ts=\"1762000000\""), "timestamp key missing");
+        assert!(html.contains("data-ts=\"0\""), "missing timestamp must sort as 0");
+        let expected = chrono::Local
+            .timestamp_opt(1762000000, 0)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        assert!(
+            html.contains(&expected),
+            "timestamp display must match the inventory page's format"
+        );
+        assert!(html.contains("\u{2014}"), "unstamped directory shows an em dash");
+        assert!(
+            html.contains("let key = \"latest\", dir = -1;"),
+            "the index must open newest-first"
+        );
         // Display text stays human-readable.
         assert!(html.contains("4.1 kB") && html.contains("64 B"), "display size wrong");
         std::fs::remove_dir_all(&root).ok();
