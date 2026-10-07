@@ -223,13 +223,17 @@ img.thumb { width: 64px; height: 48px; object-fit: cover; border-radius: 4px; ba
 #detail.open { display: block; }
 #detail h2 { margin: .2em 0 .1em; }
 #detail .sub { color: #9aa7b5; margin-bottom: .8em; }
-#detail img { width: 100%; border-radius: 6px; margin: .6em 0; }
+#detail img { max-width: 100%; max-height: 40vh; width: auto; height: auto; object-fit: contain; display: block; margin: .6em auto; background: #000; border-radius: 6px; }
+#detail img.full { max-height: none; }
+#hdr { position: sticky; top: 0; z-index: 3; background: #161d27; text-align: right; padding: .2em 0; }
+#hdr span { cursor: pointer; color: #9aa7b5; margin-left: 1em; }
+#fullsize { font-size: .9em; border: 1px solid #33404f; border-radius: 4px; padding: .2em .6em; }
 #detail dl { display: grid; grid-template-columns: max-content 1fr; gap: .25em .8em; font-size: .9em; }
 #detail dt { color: #9aa7b5; }
 #detail dd { margin: 0; }
 #detail .notes { margin-top: .8em; white-space: pre-wrap; font-size: .92em; line-height: 1.35; }
 #detail .links a { margin-right: .8em; }
-#close { float: right; cursor: pointer; color: #9aa7b5; font-size: 1.2em; }
+#close { font-size: 1.2em; }
 </style>
 </head>
 <body>
@@ -278,9 +282,12 @@ img.thumb { width: 64px; height: 48px; object-fit: cover; border-radius: 4px; ba
 </tr></thead>
 <tbody id="rows"></tbody>
 </table>
-<div id="detail"><span id="close">&times;</span><div id="detail-body"></div></div>
+<div id="detail">
+  <div id="hdr"><span id="fullsize">Full size</span><span id="close">&times;</span></div>
+  <div id="detail-body"></div>
+</div>
 <script>
-let DATA = null, sortKey = 'id', sortDir = 1;
+let DATA = null, sortKey = 'id', sortDir = 1, currentId = null;
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = v => v == null ? '' : (Math.abs(v) >= 100 ? Math.round(v) : Math.round(v * 100) / 100);
@@ -438,13 +445,24 @@ $('rows').addEventListener('click', ev => {
   if (o.astrobin_url) links.push(`<a href="${esc(o.astrobin_url)}" target="_blank">Astrobin</a>`);
   if (o.simbad_url) links.push(`<a href="${esc(o.simbad_url)}" target="_blank">SIMBAD</a>`);
   if (o.aladin_url) links.push(`<a href="${esc(o.aladin_url)}" target="_blank">Aladin</a>`);
+  if (o.thumb) links.push(`<a href="/compendium/thumb/${o.id}" target="_blank">Full image</a>`);
   $('detail-body').innerHTML = `
     <h2>${esc(o.name)}</h2><div class="sub">${esc(o.type)} / ${esc(o.subtype)} &middot; ${esc(o.constellation)} &middot; #${o.id}</div>
-    ${o.thumb ? `<img src="/compendium/thumb/${o.id}" alt="">` : ''}
+    ${o.thumb ? `<img id="detail-img" src="/compendium/thumb/${o.id}" alt="">` : ''}
     <dl>${rows.join('')}</dl>
     ${o.notes ? `<div class="notes">${esc(o.notes)}</div>` : ''}
     <p class="links">${links.join(' ')}</p>`;
+  currentId = o.id;
   $('detail').classList.add('open');
+  $('detail').scrollTop = 0;
+  const img = $('detail-img');
+  if (img) img.classList.remove('full');
+  $('fullsize').textContent = 'Full size';
+});
+$('fullsize').addEventListener('click', () => {
+  const img = $('detail-img');
+  if (!img || currentId == null) return;
+  $('fullsize').textContent = img.classList.toggle('full') ? 'Fit' : 'Full size';
 });
 $('close').addEventListener('click', () => $('detail').classList.remove('open'));
 document.addEventListener('keydown', e => { if (e.key === 'Escape') $('detail').classList.remove('open'); });
