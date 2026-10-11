@@ -596,6 +596,13 @@ pub fn human_bytes(n: u64) -> String {
 /// move / copy / symlink / delete the marked set. All data arrives from
 /// `/review/manifest`.
 ///
+/// There is **no destination dropdown in the bar**: Move / Copy / Symlink open
+/// a dedicated destination screen with its own dropdown, a free-text path box
+/// (any directory inside a review root, creatable on the spot), a
+/// create-directory control, destination stats (existing-file count and
+/// duplicate-name list), and a confirm button. Delete opens the confirm
+/// overlay directly.
+///
 /// `nav_repeat_ms` is the autorepeat throttle for the arrow keys, injected from
 /// config so the scroll rate is tunable without touching the page.
 pub fn render_review(dir: &str, nav_repeat_ms: u64) -> String {
@@ -609,38 +616,40 @@ __CSS__
 body { margin: 0; background: #111; color: #ddd; }
 #bar { position: sticky; top: 0; background: #1b1b1b; border-bottom: 1px solid #333;
        padding: 8px 12px; display: flex; gap: 12px; align-items: center;
-       flex-wrap: wrap; z-index: 5; font-size: 13px; }
+       justify-content: center; flex-wrap: wrap; z-index: 5; font-size: 13px; }
 #bar a { color: #8cf; text-decoration: none; }
 #dir { font-weight: 600; word-break: break-all; }
 .badge { padding: 2px 8px; border-radius: 3px; font-size: 12px; font-weight: 700; }
 .b-mark { background: #2c6e49; color: #fff; }
-.b-none { background: #333; color: #888; }
-#stage { text-align: center; padding: 10px 12px 24px; }
+#stage { text-align: center; padding: 10px 12px 70px; }
+/* Mouse-driven navigation, pinned to the bottom of the viewport. */
+#nav { position: fixed; bottom: 0; left: 0; right: 0; background: #1b1b1b;
+       border-top: 1px solid #333; padding: 8px 12px; display: flex;
+       gap: 12px; justify-content: center; z-index: 5; }
 #img { max-width: 100%; max-height: 76vh; background: #000; border: 1px solid #333; }
 #meta { font-size: 12px; color: #999; margin-top: 8px; word-break: break-all; }
-#meta .warn { color: #fc6; }
 #grp { color: #8cf; font-weight: 600; }
 #overlay { position: fixed; inset: 0; background: #111; display: none;
            overflow: auto; padding: 20px 24px; z-index: 10; }
 #overlay.show { display: block; }
+#dstscreen { position: fixed; inset: 0; background: #111; display: none;
+             overflow: auto; padding: 20px 24px; z-index: 11; }
+#dstscreen.show { display: block; }
+#dstinfo { font-size: 13px; margin: 12px 0 16px; }
+#dstinfo ul { margin: 4px 0 8px 18px; }
+#dstpath { background: #222; color: #ddd; border: 1px solid #444; padding: 4px; }
 table { border-collapse: collapse; width: 100%; font-size: 12px; margin: 8px 0 16px; }
 td, th { padding: 4px 8px; border-bottom: 1px solid #2a2a2a; text-align: left; }
 td.num { text-align: right; }
 .col { color: #f88; }
-button { padding: 6px 14px; background: #2c6e49; border: 0; color: #fff;
+/* One uniform style for every button; the only variation is the disabled
+   state. The selected operation is tracked by the `active` class alone — it
+   carries no styling, so every button looks identical. */
+button { padding: 6px 14px; background: #333; border: 0; color: #fff;
          cursor: pointer; border-radius: 3px; font-size: 13px; }
-button:disabled { background: #333; color: #777; cursor: default; }
-button.plain { background: #333; }
-button.danger { background: #c0392b; }
-/* Action buttons: the pressed operation stays visibly selected. */
-.opbtn { background: #333; }
-.opbtn.active { background: #2c6e49; outline: 2px solid #4f9e6f; }
-.opbtn.danger { background: #7a2f24; }
-.opbtn.danger.active { background: #c0392b; outline: 2px solid #e06a5b; }
+button:disabled { color: #777; cursor: default; }
 select { background: #222; color: #ddd; border: 1px solid #444; padding: 4px; max-width: 320px; }
-select:disabled { opacity: 0.4; }
 #newname { background: #222; color: #ddd; border: 1px solid #444; padding: 4px; }
-#hint { color: #777; }
 #load { color: #9ab; padding: 30px; }
 </style>
 </head>
@@ -649,44 +658,61 @@ select:disabled { opacity: 0.4; }
   <a href="/review">&larr; directories</a>
   <span id="dir">__DIR__</span>
   <span id="counter"></span>
-  <span id="badge" class="badge b-none">UNMARKED</span>
   <span id="grp"></span>
   <span id="ops">
-    <button class="opbtn active" data-op="move">Move</button>
-    <button class="opbtn" data-op="copy">Copy</button>
-    <button class="opbtn" data-op="symlink">Symlink</button>
-    <button class="opbtn danger" data-op="delete">Delete</button>
+    <button class="opbtn active" data-op="move" title="Move the marked files to a destination directory — they leave this directory">Move</button>
+    <button class="opbtn" data-op="copy" title="Copy the marked files to a destination directory — this directory keeps the originals">Copy</button>
+    <button class="opbtn" data-op="symlink" title="Create symbolic links to the marked files in a destination directory — the files themselves stay here">Symlink</button>
+    <button class="opbtn" data-op="delete" title="Permanently delete the marked files &mdash; this cannot be undone">Delete</button>
   </span>
-  <label id="dstlabel">to <select id="dest"></select></label>
-  <span id="newrow" style="display:none">
-    <select id="newtel"></select>
-    <input id="newname" type="text" size="18" placeholder="object name">
-    <button id="btnNew">Create</button>
-    <button id="btnNewCancel" class="plain">Cancel</button>
-    <span id="newmsg" class="col" style="display:none"></span>
-  </span>
-  <label>sort <select id="sort">
-    <option value="sig">&sigma; (lower = cleaner)</option>
-    <option value="q">sky/&sigma;</option>
-    <option value="med">median</option>
+  <label>sort <select id="sort" title="Choose the order in which frames are shown in the slideshow">
+    <option value="star">&#9733; star tail (&sigma;)</option>
+    <option value="med">median (faintest first)</option>
   </select></label>
-  <button id="btnAll" class="plain">Mark all (A)</button>
-  <button id="btnNone" class="plain">Unmark all (N)</button>
-  <button id="btnInv" class="plain">Invert (I)</button>
-  <button id="btnSummary">Summary (G)</button>
-  <span id="hint">Space mark + next &middot; U unmark &middot; A all &middot; N none &middot; I invert &middot; &larr;/&rarr; move (hold to scroll, throttled to __REPEAT__ ms) &middot; a Move/Copy/Symlink/Delete button opens the summary</span>
+  <span id="badge" class="badge b-mark" style="display:none"></span>
 </div>
 <div id="stage">
   <div id="load">Scanning&hellip;</div>
   <img id="img" alt="" style="display:none">
   <div id="meta"></div>
 </div>
+<div id="nav">
+  <button id="btnHome" title="Jump to the first frame (key: Home)">&#9198;</button>
+  <button id="btnPrev" title="Go to the previous frame (shortcut: &larr;)">&#9664; Previous</button>
+  <button id="btnMarkNext" title="Mark the current frame and advance to the next (shortcut: Space)">Mark + Next (Space)</button>
+  <button id="btnToggle" title="Mark or unmark the current frame without advancing (shortcut: M)">Toggle mark (M)</button>
+  <button id="btnAll" class="plain" title="Mark every frame in this directory (shortcut: A)">Mark all (A)</button>
+  <button id="btnNone" class="plain" title="Remove the mark from every frame (shortcut: U)">Unmark all (U)</button>
+  <button id="btnInv" class="plain" title="Toggle the mark of every frame (shortcut: I)">Invert (I)</button>
+  <button id="btnNext" title="Go to the next frame (shortcut: &rarr;)">Next &#9654;</button>
+  <button id="btnEnd" title="Jump to the last frame (key: End)">&#9197;</button>
+</div>
 <div id="overlay">
   <h2>Confirm</h2>
   <div id="sum"></div>
-  <button id="btnApply" disabled>Apply</button>
-  <button id="btnClose" class="plain">Close (Esc)</button>
+  <button id="btnApply" disabled title="Apply the operation to the marked files — press twice to confirm">Apply</button>
+  <button id="btnClose" class="plain" title="Close this panel and return to the slideshow (shortcut: Esc)">Close (Esc)</button>
   <div id="result"></div>
+</div>
+<div id="dstscreen">
+  <h2 id="dsttitle">Destination</h2>
+  <div id="dstpick">
+    <label>destination <select id="dest" title="Pick an existing destination directory"></select></label>
+    <input id="dstpath" type="text" size="30" placeholder="or type any directory path under a review root" title="Type any directory path under a review root, then press Go or Enter">
+    <button id="btnGo" class="plain" title="Look up the typed path and make it the destination">Go</button>
+    <button id="btnNewOpen" class="plain" title="Create a new object directory under an existing telescope">＋ Create new directory</button>
+  </div>
+  <div id="newrow" style="display:none">
+    <select id="newtel" title="Parent telescope for the new directory"></select>
+    <input id="newname" type="text" size="18" placeholder="object name" title="Name of the new object directory">
+    <button id="btnNew" title="Create the new directory and select it as the destination">Create</button>
+    <button id="btnNewCancel" class="plain" title="Cancel creating a new directory">Cancel</button>
+    <span id="newmsg" class="col" style="display:none"></span>
+  </div>
+  <div id="dstinfo"></div>
+  <button id="btnConfirm" disabled title="Perform the operation on the marked files — press twice to confirm">Confirm</button>
+  <button id="btnDstBack" class="plain" title="Return to the slideshow without doing anything (shortcut: Esc)">Back (Esc)</button>
+  <div id="dstresult"></div>
 </div>
 <script>
 "use strict";
@@ -715,22 +741,20 @@ let i = 0;
 let lastNav = 0;   // throttle for held arrow keys
 let dest = "";
 let destFiles = new Set();
-const NEW = "__new__";   // sentinel for the "new destination" option, never a real path
+let destInfo = null;   // last /review/destinfo payload for the chosen path
 
 const OP_LABEL = { move: "Move", copy: "Copy", symlink: "Symlink", delete: "Delete" };
-// The pressed action button is the state: `Move` is the default, `Delete` needs
-// no destination.
+// The pressed action button is the state. Move/Copy/Symlink open the
+// destination screen (`pendingOp` is the op being confirmed there); Delete
+// opens the confirm overlay directly.
 let op = "move";
+let pendingOp = null;
 const curOp = () => op;
-const needsDst = () => curOp() !== "delete";
 
 function setOp(o) {
   op = o;
   for (const b of document.querySelectorAll("#ops .opbtn"))
     b.classList.toggle("active", b.dataset.op === o);
-  $("dstlabel").style.display = needsDst() ? "" : "none";
-  $("dest").disabled = !needsDst();
-  if ($("overlay").classList.contains("show")) renderSummary();
 }
 
 const collides = (f) => destFiles.has(f.name);
@@ -740,9 +764,10 @@ function flat() {
   frames = [];
   for (const g of manifest.groups) {
     const fs = g.frames.slice();
-    if (mode === "med") fs.sort((a, b) => b.median - a.median);
-    else if (mode === "sig") fs.sort((a, b) => a.sigma - b.sigma);
-    else fs.sort((a, b) => b.quality - a.quality);
+    if (mode === "med") fs.sort((a, b) => a.median - b.median);
+    // Default: star tail — how far the bright pixels reach above the sky,
+    // in noise units. Bare sky (~4) sinks, star fields rise.
+    else fs.sort((a, b) => b.star_signal - a.star_signal);
     const label = (g.imagetype || "?") + " \u00b7 " + (g.filter || "?") + " (" + fs.length + ")";
     for (const f of fs) { f.grp = label; frames.push(f); }
   }
@@ -761,10 +786,23 @@ const FILTER_BORDER = {
 };
 const borderFor = (f) => FILTER_BORDER[f.filter] || "#808080";
 
-function setBadge(m) {
+// The badge reports the total number of marked files and disappears when
+// nothing is marked. The current frame's own status lives on the meta line
+// (label + yellow) and as a yellow ring around the image.
+function setBadge() {
+  const n = markedFiles().length;
   const b = $("badge");
-  b.className = "badge " + (m ? "b-mark" : "b-none");
-  b.textContent = m ? "MARKED" : "UNMARKED";
+  b.style.display = n ? "" : "none";
+  b.className = "badge b-mark";
+  b.textContent = n + " marked";
+  const m = frames[i] ? isMarked(frames[i]) : false;
+  const st = $("mstat");
+  if (st) st.textContent = m ? "MARKED" : "UNMARKED";
+  $("meta").style.color = m ? "#FFD700" : "";
+  // Marked files wear a yellow ring around the filter-colour frame. outline
+  // draws outside the border, so the filter colour stays visible underneath,
+  // and setBadge repaints it on every mark change (Space, mark-all, invert).
+  $("img").style.outline = m ? "3px solid #FFD700" : "none";
 }
 
 function show() {
@@ -773,7 +811,8 @@ function show() {
     $("load").style.display = "";
     $("load").textContent = "No images here.";
     $("counter").textContent = ""; $("grp").textContent = ""; $("meta").textContent = "";
-    setBadge(false);
+    setBadge();
+    for (const id of ["btnHome", "btnPrev", "btnMarkNext", "btnToggle", "btnNext", "btnEnd"]) $(id).disabled = true;
     return;
   }
   const f = frames[i];
@@ -783,14 +822,18 @@ function show() {
   $("img").style.border = "4px solid " + borderFor(f);
   $("counter").textContent = (i + 1) + " / " + frames.length;
   $("grp").textContent = f.grp;
-  setBadge(isMarked(f));
-  const warn = needsDst() && dest && collides(f)
-    ? ' <span class="warn">\u26a0 name already exists in the destination</span>' : "";
   $("meta").innerHTML = f.name + " &middot; " + f.exptime + "s &middot; "
     + f.width + "\u00d7" + f.height + " &middot; med " + f.median.toFixed(1)
-    + " &middot; \u03c3 " + f.sigma.toFixed(2) + " &middot; sky/\u03c3 " + f.quality.toFixed(1) + warn;
+    + " &middot; \u03c3 " + f.sigma.toFixed(2) + " &middot; sky/\u03c3 " + f.quality.toFixed(1)
+    + " &middot; <span id=\"mstat\"></span>";
+  setBadge();
   // Warm the browser cache for the next frame so the slideshow stays instant.
   if (frames[i + 1]) new Image().src = src(frames[i + 1]);
+  // Bottom nav: the arrows are inert at the ends of the sequence.
+  $("btnHome").disabled = i === 0;
+  $("btnPrev").disabled = i === 0;
+  $("btnNext").disabled = i >= frames.length - 1;
+  $("btnEnd").disabled = i >= frames.length - 1;
 }
 
 // Space marks the current frame and advances: the culling gesture is one key
@@ -798,24 +841,26 @@ function show() {
 function toggleMark() {
   const f = frames[i]; if (!f) return;
   setMark(f, !isMarked(f));
-  saveMarks(); setBadge(isMarked(f));
+  saveMarks(); setBadge();
   if (i < frames.length - 1) { i++; show(); }
 }
-function unmarkCurrent() {
+// Toggle without advancing: for reviewing the current frame up close.
+function toggleMarkStay() {
   const f = frames[i]; if (!f) return;
-  setMark(f, false); saveMarks(); setBadge(false);
+  setMark(f, !isMarked(f));
+  saveMarks(); setBadge();
 }
 function markAll() {
   for (const f of frames) setMark(f, true);
-  saveMarks(); setBadge(isMarked(frames[i]));
+  saveMarks(); setBadge();
 }
 function unmarkAll() {
   marks = {};
-  saveMarks(); setBadge(isMarked(frames[i]));
+  saveMarks(); setBadge();
 }
 function invertMarks() {
   for (const f of frames) setMark(f, !isMarked(f));
-  saveMarks(); setBadge(isMarked(frames[i]));
+  saveMarks(); setBadge();
 }
 
 const markedFiles = () => frames.filter(isMarked);
@@ -823,20 +868,13 @@ const markedFiles = () => frames.filter(isMarked);
 function renderSummary() {
   const sel = markedFiles();
   const o = curOp();
-  const dst = needsDst() ? dest : null;
   let h = "<h3>" + OP_LABEL[o] + " <b>" + sel.length + "</b> of " + frames.length
-     + " file" + (frames.length === 1 ? "" : "s")
-     + (dst ? " \u2192 " + (dst || "<span class=col>no destination chosen</span>") : "")
-     + "</h3>";
+     + " file" + (frames.length === 1 ? "" : "s") + "</h3>";
   if (!sel.length) h += "<p class=col>Nothing is marked \u2014 there is nothing to do.</p>";
   if (o === "delete")
-    h += "<p class=col>Deletes are permanent. Staging is Syncthing-shared, so a delete propagates to the capture machines.</p>";
-  if (dst) {
-    const clash = sel.filter(collides);
-    if (clash.length)
-      h += "<p class=col>\u26a0 " + clash.length + " file(s) already exist in the destination. "
-         + "Those will be reported as failures, never overwritten.</p>";
-  }
+    h += "<p class=col>Deletes are permanent and cannot be undone.</p>";
+  else
+    h += "<p class=meta>Press " + OP_LABEL[o] + " to choose a destination and confirm.</p>";
   if (sel.length) {
     h += "<table><tr><th>file</th><th>sky/\u03c3</th></tr>";
     const cap = 200;
@@ -848,9 +886,11 @@ function renderSummary() {
   }
   $("sum").innerHTML = h;
   $("result").textContent = "";
+  // Only Delete is applied from this overlay; the other three operations are
+  // confirmed on the destination screen.
   const btn = $("btnApply");
-  btn.disabled = !sel.length || (needsDst() && !dest);
-  btn.className = o === "delete" ? "danger" : "";
+  btn.style.display = o === "delete" ? "" : "none";
+  btn.disabled = !sel.length;
   btn.textContent = "Apply";
   btn.dataset.armed = "";
 }
@@ -864,13 +904,11 @@ async function applyAll() {
   if (btn.dataset.armed !== "1") {
     btn.dataset.armed = "1";
     btn.textContent = "Confirm \u2014 " + OP_LABEL[o] + " " + sel.length
-      + " file" + (sel.length === 1 ? "" : "s")
-      + (needsDst() ? " \u2192 " + dest : "") + " (cannot be undone)";
+      + " file" + (sel.length === 1 ? "" : "s") + " (cannot be undone)";
     return;
   }
-  if (needsDst() && !dest) { $("result").textContent = "Choose a destination first."; return; }
   btn.disabled = true;
-  const body = { dir: DIR, op: o, dst: needsDst() ? dest : null, files: sel.map((f) => f.path) };
+  const body = { dir: DIR, op: o, dst: null, files: sel.map((f) => f.path) };
   let rep;
   try {
     const r = await fetch("/review/apply", {
@@ -902,22 +940,171 @@ async function applyAll() {
   btn.disabled = false;
 }
 
+// The destination screen: dropdown, create-directory row, destination stats,
+// and the confirm button. Reached only by pressing Move / Copy / Symlink.
+async function openDestScreen(o) {
+  pendingOp = o;
+  const n = markedFiles().length;
+  $("dsttitle").textContent = OP_LABEL[o] + " " + n + " file" + (n === 1 ? "" : "s") + " to\u2026";
+  $("dstresult").textContent = "";
+  $("newrow").style.display = "none";
+  disarmConfirm();
+  $("dstscreen").classList.add("show");
+  await onDest();
+}
+
 async function onDest() {
-  const v = $("dest").value;
-  // The sentinel is a UI affordance, not a destination: never persist it and
-  // never let it become the target.
-  if (v === NEW) { setBadge(frames[i] ? isMarked(frames[i]) : false); return; }
-  dest = v;
-  localStorage.setItem("reviewdst:" + DIR, dest);
+  dest = $("dest").value;
+  if (dest) localStorage.setItem("reviewdst:" + DIR, dest);
   destFiles = new Set();
+  destInfo = null;
   if (dest) {
     try {
-      const r = await fetch("/review/destfiles?dir=" + encodeURIComponent(dest));
-      if (r.ok) for (const n of await r.json()) destFiles.add(n);
-    } catch (e) { /* collision pre-check is advisory only */ }
+      const r = await fetch("/review/destinfo?dir=" + encodeURIComponent(dest));
+      if (r.ok) {
+        destInfo = await r.json();
+        for (const n of (destInfo.names || [])) destFiles.add(n);
+      }
+    } catch (e) { /* the info panel is advisory; apply re-checks every name */ }
   }
-  setBadge(frames[i] ? isMarked(frames[i]) : false);
-  show();
+  renderDstInfo();
+}
+
+// Type an arbitrary path: the server validates it against the review roots
+// and reports whether it exists. Unknown-but-inside paths become selectable
+// options so the info panel and the create flow can act on them.
+async function gotoPath() {
+  const p = $("dstpath").value.trim();
+  if (!p) return;
+  let info;
+  try {
+    const r = await fetch("/review/destinfo?dir=" + encodeURIComponent(p));
+    if (!r.ok) {
+      $("dstinfo").innerHTML = "<p class=col>" + (await r.text()) + "</p>";
+      return;
+    }
+    info = await r.json();
+  } catch (e) {
+    $("dstinfo").innerHTML = "<p class=col>lookup failed: " + e + "</p>";
+    return;
+  }
+  const sel = $("dest");
+  if (!Array.from(sel.options).some((x) => x.value === info.path)) {
+    const o = document.createElement("option");
+    o.value = info.path; o.textContent = info.path;
+    sel.insertBefore(o, sel.options[0] || null);
+  }
+  sel.value = info.path;
+  await onDest();
+}
+
+// Create the currently-chosen path (which destinfo reported as missing).
+async function mkdirDest() {
+  if (!dest) return;
+  let r;
+  try {
+    r = await fetch("/review/mkdir", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ dir: dest }),
+    });
+  } catch (e) { r = null; }
+  if (!r || !r.ok) {
+    const msg = r ? await r.text() : "request failed";
+    $("dstinfo").insertAdjacentHTML("beforeend", "<p class=col>" + msg + "</p>");
+    return;
+  }
+  const d = await r.json();
+  await loadDests();
+  const sel = $("dest");
+  if (Array.from(sel.options).some((x) => x.value === d.path)) sel.value = d.path;
+  await onDest();
+}
+
+// Basic destination facts, recomputed whenever the selection or the marks
+// change: how many files are already there, and how many of the marked files
+// would collide by name.
+function renderDstInfo() {
+  const sel = markedFiles();
+  const btn = $("btnConfirm");
+  if (!dest) {
+    $("dstinfo").innerHTML = "<p class=col>Choose a destination directory.</p>";
+    btn.disabled = true;
+    return;
+  }
+  if (destInfo && !destInfo.exists) {
+    $("dstinfo").innerHTML = "<p class=col><b>" + dest + "</b> does not exist yet.</p>"
+      + "<button id=\"btnMk\" title=\"Create this directory inside the review root\">Create directory</button>";
+    $("btnMk").addEventListener("click", mkdirDest);
+    btn.disabled = true;
+    return;
+  }
+  const clash = sel.filter(collides);
+  const nFiles = destInfo ? destInfo.files : destFiles.size;
+  let h = "<p><b>" + dest + "</b></p><ul>"
+    + "<li>Existing files: " + nFiles + "</li>"
+    + "<li>Duplicate file names: " + clash.length + (clash.length ? " \u26a0" : "") + "</li></ul>";
+  if (clash.length) {
+    h += "<ul>";
+    for (const f of clash.slice(0, 50)) h += "<li class=col>" + f.name + "</li>";
+    h += "</ul>";
+    if (clash.length > 50) h += "<p class=meta>\u2026 and " + (clash.length - 50) + " more</p>";
+    h += "<p class=meta>Duplicates are never overwritten \u2014 they are reported as failures.</p>";
+  }
+  $("dstinfo").innerHTML = h;
+  btn.disabled = !sel.length;
+}
+
+function disarmConfirm() {
+  const btn = $("btnConfirm");
+  btn.dataset.armed = "";
+  btn.textContent = "Confirm";
+}
+
+async function confirmApply() {
+  const btn = $("btnConfirm");
+  const sel = markedFiles();
+  if (!sel.length || !dest) return;
+  // Two-step confirm: the first press restates the operation, quantity, and
+  // destination on the button itself.
+  if (btn.dataset.armed !== "1") {
+    btn.dataset.armed = "1";
+    btn.textContent = "Confirm \u2014 " + OP_LABEL[pendingOp] + " " + sel.length
+      + " file" + (sel.length === 1 ? "" : "s") + " \u2192 " + dest;
+    return;
+  }
+  btn.disabled = true;
+  const body = { dir: DIR, op: pendingOp, dst: dest, files: sel.map((f) => f.path) };
+  let rep;
+  try {
+    const r = await fetch("/review/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    rep = await r.json();
+    if (typeof rep !== "object") rep = { moved: 0, copied: 0, linked: 0, deleted: 0, errors: [String(rep)] };
+  } catch (e) {
+    $("dstresult").textContent = "Apply failed: " + e;
+    btn.disabled = false;
+    return;
+  }
+  for (const f of sel) delete marks[f.path];
+  saveMarks();
+  let h = "<p>Moved " + rep.moved + ", copied " + rep.copied + ", symlinked "
+     + rep.linked + ", deleted " + rep.deleted + ".</p>";
+  if (rep.errors && rep.errors.length) {
+    h += "<p class=col>" + rep.errors.length + " problem(s), not rolled back:</p><ul>";
+    for (const e of rep.errors) h += "<li class=col>" + e + "</li>";
+    h += "</ul>";
+  }
+  $("dstresult").innerHTML = h;
+  // Re-fetch the now-drained directory and the refreshed destination stats.
+  const m = await (await fetch("/review/manifest?dir=" + encodeURIComponent(DIR))).json();
+  manifest = m; flat(); show();
+  await onDest();
+  disarmConfirm();
+  btn.disabled = false;
 }
 
 async function loadDests() {
@@ -928,14 +1115,12 @@ async function loadDests() {
   const keep = sel.value;
   sel.innerHTML = "";
   for (const d of ds) { const o = document.createElement("option"); o.value = d.path; o.textContent = d.label; sel.appendChild(o); }
-  const o = document.createElement("option");
-  o.value = NEW; o.textContent = "\uFF0B new destination\u2026";
-  sel.appendChild(o);
-  // Telescope choices are the CCD prefixes already in the list: creating a
-  // whole new telescope is a separate decision and stays on the index form.
+  // Telescope choices are the telescopes already in the list (`CCD/tel`,
+  // `CCD/tel/obj` labels, so the telescope is segment 1): creating a whole
+  // new telescope is a separate decision and stays on the index form.
   const ts = $("newtel");
   ts.innerHTML = "";
-  for (const t of [...new Set(ds.map((d) => d.label.split("/")[0]))].sort()) {
+  for (const t of [...new Set(ds.map((d) => d.label.split("/")[1]))].sort()) {
     const x = document.createElement("option"); x.value = t; x.textContent = t; ts.appendChild(x);
   }
   // Fuzzy default: the reviewed directory's basename against every candidate.
@@ -954,6 +1139,10 @@ function showNewRow() {
   $("newrow").style.display = "";
   $("newname").focus();
   $("newname").select();
+}
+
+function hideNewRow() {
+  $("newrow").style.display = "none";
 }
 
 async function createDest() {
@@ -975,13 +1164,12 @@ async function createDest() {
       return;
     }
     const j = await r.json();
-    $("newrow").style.display = "none";
+    hideNewRow();
     $("newname").dataset.touched = "";
     await loadDests();
     const sel = $("dest");
     if (Array.from(sel.options).some((x) => x.value === j.path)) sel.value = j.path;
     await onDest();
-    sel.blur();
   } catch (e) {
     msg.textContent = "create failed: " + e;
     msg.style.display = "";
@@ -999,50 +1187,63 @@ document.addEventListener("keydown", (e) => {
   // Marks must never machine-gun, but browsing should: arrows keep autorepeat
   // so holding one scrolls the set, throttled by REPEAT_MS (config) so the OS
   // repeat rate cannot outrun image loading (a cold preview is ~270 ms).
-  const NAV = ["ArrowRight", "l", "L", "ArrowLeft", "h", "H"];
+  const NAV = ["ArrowRight", "ArrowLeft"];
   if (!NAV.includes(e.key) && e.repeat) return;
   if (e.repeat && performance.now() - lastNav < REPEAT_MS) return;
   switch (e.key) {
     case " ": e.preventDefault(); toggleMark(); break;
-    case "u": case "U": unmarkCurrent(); break;
+    case "u": case "U": unmarkAll(); break;
     case "a": case "A": markAll(); break;
-    case "n": case "N": unmarkAll(); break;
+    case "m": case "M": toggleMarkStay(); break;
     case "i": case "I": invertMarks(); break;
-    case "ArrowRight": case "l": case "L": e.preventDefault(); lastNav = performance.now(); if (i < frames.length - 1) { i++; show(); } break;
-    case "ArrowLeft": case "h": case "H": e.preventDefault(); lastNav = performance.now(); if (i > 0) { i--; show(); } break;
-    case "g": case "G": renderSummary(); $("overlay").classList.add("show"); break;
-    case "Escape": $("overlay").classList.remove("show"); break;
+    case "ArrowRight": e.preventDefault(); lastNav = performance.now(); if (i < frames.length - 1) { i++; show(); } break;
+    case "ArrowLeft": e.preventDefault(); lastNav = performance.now(); if (i > 0) { i--; show(); } break;
+    case "Home": e.preventDefault(); if (i !== 0) { i = 0; show(); } break;
+    case "End": e.preventDefault(); { const last = frames.length - 1; if (i !== last) { i = last; show(); } } break;
+    case "Escape": $("overlay").classList.remove("show"); $("dstscreen").classList.remove("show"); break;
   }
 });
 
 $("sort").addEventListener("change", () => { flat(); show(); });
 for (const b of Array.from(document.querySelectorAll("#ops .opbtn"))) {
-  // Pressing an action states the operation and opens the confirmation, so the
-  // gesture is: mark, press the button, confirm.
+  // Pressing an action states the operation and opens its confirmation
+  // screen, so the gesture is: mark, press the button, choose a destination,
+  // confirm. Delete needs no destination and goes straight to the overlay.
   b.addEventListener("click", () => {
     setOp(b.dataset.op);
-    renderSummary();
-    $("overlay").classList.add("show");
+    if (b.dataset.op === "delete") {
+      renderSummary();
+      $("overlay").classList.add("show");
+    } else {
+      openDestScreen(b.dataset.op);
+    }
   });
 }
-$("dest").addEventListener("change", (e) => {
-  if (e.target.value === NEW) { e.target.value = dest; showNewRow(); return; }
-  onDest();
-  e.target.blur();
+$("dest").addEventListener("change", (e) => { onDest(); e.target.blur(); });
+$("btnGo").addEventListener("click", gotoPath);
+$("dstpath").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); gotoPath(); }
 });
+$("btnNewOpen").addEventListener("click", showNewRow);
 $("btnNew").addEventListener("click", createDest);
-$("btnNewCancel").addEventListener("click", () => {
-  $("newrow").style.display = "none";
-  $("dest").blur();
-});
+$("btnNewCancel").addEventListener("click", hideNewRow);
+$("btnConfirm").addEventListener("click", confirmApply);
+$("btnDstBack").addEventListener("click", () => $("dstscreen").classList.remove("show"));
 $("newname").addEventListener("input", () => { $("newname").dataset.touched = "1"; });
 $("newname").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); createDest(); }
 });
 $("btnAll").addEventListener("click", markAll);
+// Bottom navigation bar: the same gestures as the keyboard, for the mouse.
+$("btnPrev").addEventListener("click", () => { if (i > 0) { i--; show(); } });
+$("btnHome").addEventListener("click", () => { if (i !== 0) { i = 0; show(); } });
+$("btnEnd").addEventListener("click", () => { const last = frames.length - 1; if (i !== last) { i = last; show(); } });
+$("btnNext").addEventListener("click", () => { if (i < frames.length - 1) { i++; show(); } });
+$("btnMarkNext").addEventListener("click", toggleMark);
+$("btnToggle").addEventListener("click", toggleMarkStay);
 $("btnNone").addEventListener("click", unmarkAll);
 $("btnInv").addEventListener("click", invertMarks);
-$("btnSummary").addEventListener("click", () => { renderSummary(); $("overlay").classList.add("show"); });
+
 $("btnClose").addEventListener("click", () => $("overlay").classList.remove("show"));
 $("btnApply").addEventListener("click", applyAll);
 
@@ -1155,25 +1356,62 @@ mod tests {
     fn review_page_carries_the_configured_autorepeat_throttle() {
         let html = render_review("/data/Astro/CCD/81GT/M42", 500);
         assert!(html.contains("data-repeat=\"500\""), "throttle not injected");
-        assert!(html.contains("throttled to 500 ms"), "throttle not shown to the user");
         assert!(html.contains("REPEAT_MS"), "throttle not used by the key handler");
         assert!(!html.contains("__REPEAT__"), "placeholder left unsubstituted");
     }
 
     /// The screen is generic: all four operations and every mark gesture must
-    /// be present, and the confirmation must state operation + quantity.
+    /// be present. Move/Copy/Symlink open a dedicated destination screen with
+    /// its own dropdown, create-directory controls, destination stats, and a
+    /// confirm button; the bar itself must not carry a destination dropdown.
     #[test]
     fn review_page_binds_the_mark_keys_and_all_four_operations() {
         let html = render_review("/ssd/sync/Pier/Jacoby1", 500);
-        for fn_name in ["toggleMark", "markAll", "unmarkAll", "invertMarks", "unmarkCurrent", "setOp"] {
+        for fn_name in ["toggleMark", "markAll", "unmarkAll", "invertMarks", "setOp"] {
             assert!(html.contains(fn_name), "{fn_name} missing");
         }
+        // U unmarks everything; the old N binding and the hint line are gone.
+        assert!(
+            html.contains("case \"u\": case \"U\": unmarkAll(); break;"),
+            "U must unmark all"
+        );
+        assert!(!html.contains("case \"n\":"), "the N binding must be removed");
+        assert!(!html.contains("id=\"hint\""), "the hint line must be removed");
+        // Every remaining keybind is displayed on a button: the vim aliases
+        // and G (Summary) are gone, and no case is duplicated.
+        for gone in ["case \"l\":", "case \"L\":", "case \"h\":", "case \"H\":", "case \"g\":", "case \"G\":"] {
+            assert!(!html.contains(gone), "undisplayed keybind remains: {gone}");
+        }
+        let mut n_m = 0;
+        let mut at = 0;
+        while let Some(p) = html[at..].find("case \"m\":") {
+            n_m += 1;
+            at += p + 1;
+        }
+        assert_eq!(n_m, 1, "the M case must appear exactly once");
         for op in ["move", "copy", "symlink", "delete"] {
             assert!(
                 html.contains(&format!("data-op=\"{op}\"")),
                 "{op} action button missing"
             );
         }
+        assert!(html.contains("id=\"dstscreen\""), "destination screen missing");
+        assert!(html.contains("id=\"dest\""), "destination dropdown missing");
+        assert!(html.contains("id=\"dstinfo\""), "destination info panel missing");
+        assert!(html.contains("id=\"btnConfirm\""), "confirm button missing");
+        assert!(
+            html.contains("id=\"newtel\"") && html.contains("id=\"btnNew\"") && html.contains("id=\"btnNewOpen\""),
+            "create-directory controls missing"
+        );
+        assert!(html.contains("Existing files"), "destination file count missing");
+        assert!(html.contains("Duplicate file names"), "duplicate-name report missing");
+        assert!(html.contains("id=\"dstpath\"") && html.contains("id=\"btnGo\""),
+            "arbitrary-path destination box missing");
+        assert!(html.contains("/review/destinfo"), "destinfo endpoint missing");
+        assert!(html.contains("/review/mkdir"), "mkdir endpoint missing");
+        assert!(html.contains("does not exist yet") && html.contains("btnMk"),
+            "create-missing-directory flow missing");
+        assert!(!html.contains("to <select"), "the bar must not carry a destination dropdown");
         assert!(html.contains("Confirm") && html.contains("OP_LABEL") && html.contains("sel.length"),
             "confirmation must state the operation and the quantity");
         assert!(html.contains("/review/apply"), "apply endpoint missing");
@@ -1204,6 +1442,183 @@ mod tests {
         assert!(
             html.contains("$(\"img\").style.border = \"4px solid \" + borderFor(f);"),
             "border must be applied on every frame change"
+        );
+    }
+
+    /// Every button wears one uniform style: no per-class overrides at all,
+    /// not even for the selected operation — `active` is an unstyled JS hook.
+    #[test]
+    fn review_page_gives_every_button_one_uniform_style() {
+        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        assert!(
+            html.contains("button { padding: 6px 14px; background: #333;"),
+            "the single base button style must set the shared background"
+        );
+        // No per-class button restyling survives in the review page's own
+        // CSS (the shared theme's `button.danger` rule stays for the index
+        // page, but the review screen must never use that class).
+        for banned in [
+            "button.plain { background",
+            ".opbtn { background",
+            ".opbtn.danger",
+            ".opbtn.active",
+        ] {
+            assert!(!html.contains(banned), "per-class button styling remains: {banned}");
+        }
+        assert!(!html.contains("opbtn danger"), "Delete must not carry a danger style");
+        assert!(!html.contains("class=\"danger\""), "no button may use the danger class");
+        assert!(!html.contains("className = \"danger\""), "no JS may set the danger class");
+    }
+
+    /// The bottom bar carries mouse-driven navigation: previous/next arrows,
+    /// mark-and-advance, and a toggle that must NOT advance the slideshow.
+    #[test]
+    fn review_page_has_a_mouse_navigation_bar() {
+        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        assert!(html.contains("id=\"nav\""), "bottom navigation bar missing");
+        for id in ["btnPrev", "btnNext", "btnMarkNext", "btnToggle"] {
+            assert!(html.contains(&format!("id=\"{id}\"")), "{id} missing");
+            assert!(
+                html.contains(&format!("$(\"{id}\").addEventListener(\"click\"")),
+                "{id} not wired to a click handler"
+            );
+        }
+        // The toggle must not move the slideshow: its body must not advance.
+        let start = html.find("function toggleMarkStay").expect("toggleMarkStay missing");
+        let body = &html[start..html.find("function markAll").expect("markAll after toggleMarkStay")];
+        assert!(!body.contains("i++"), "toggle must not advance to the next frame");
+        // The bulk-mark buttons live in the bottom bar, between the toggle
+        // and Next, and the Summary button is gone (G still opens it).
+        let nav = &html[html.find("<div id=\"nav\">").expect("nav bar")..];
+        let order = ["btnHome", "btnPrev", "btnMarkNext", "btnToggle", "btnAll", "btnNone", "btnInv", "btnNext", "btnEnd"];
+        let mut at = 0;
+        for id in order {
+            let p = nav
+                .find(&format!("id=\"{id}\""))
+                .unwrap_or_else(|| panic!("{id} missing from the nav bar"));
+            assert!(p > at, "{id} must come after the previous nav button");
+            at = p;
+        }
+        assert!(!html.contains("btnSummary"), "the Summary button must be removed");
+        // The toggle has its own shortcut, `M`, and both mark buttons state
+        // their shortcut in the label.
+        assert!(
+            html.contains("case \"m\": case \"M\": toggleMarkStay(); break;"),
+            "M must toggle the mark without advancing"
+        );
+        assert!(
+            html.contains(">Mark + Next (Space)<") && html.contains(">Toggle mark (M)<"),
+            "mark buttons must show their shortcuts in the label"
+        );
+        // Arrows are disabled at the ends of the sequence, on every repaint.
+        assert!(
+            html.contains("$(\"btnPrev\").disabled = i === 0;")
+                && html.contains("$(\"btnNext\").disabled = i >= frames.length - 1;"),
+            "arrows must be disabled at the ends"
+        );
+        // Home/End jump to the ends of the sequence, by button and by key.
+        assert!(
+            html.contains("$(\"btnHome\").addEventListener(\"click\", () => { if (i !== 0) { i = 0; show(); } });")
+                && html.contains("i = last; show();"),
+            "Home/End buttons must jump to the ends"
+        );
+        assert!(
+            html.contains("case \"Home\":") && html.contains("case \"End\":"),
+            "Home/End keys must jump too"
+        );
+    }
+
+    /// Every interactive control on the review page carries a hover tooltip
+    /// (`title`) explaining its purpose, including the dynamically created
+    /// "Create directory" button.
+    #[test]
+    fn review_page_explains_every_control_on_hover() {
+        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        for tag in ["<button", "<select", "<input"] {
+            for (n, chunk) in html.match_indices(tag) {
+                let _ = n;
+                let Some(gt) = chunk.find('>') else { continue };
+                let open_tag = &chunk[..gt];
+                // Only the page's own controls, not anything in the shared
+                // theme or a stray mention inside the script text.
+                assert!(
+                    open_tag.contains("title=") || open_tag.contains("title ="),
+                    "{tag} without a hover tooltip: {open_tag}"
+                );
+            }
+        }
+        assert!(
+            html.contains("id=\\\"btnMk\\\" title="),
+            "the dynamically created 'Create directory' button must also explain itself"
+        );
+    }
+
+    /// Sorting is star-aware by default: the dropdown leads with the star
+    /// tail, and the client-side default comparator uses `star_signal`.
+    /// The dropdown offers exactly the two kept sorts, and median runs
+    /// faintest-first.
+    #[test]
+    fn review_page_sorts_by_stars_by_default() {
+        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        assert!(html.contains("value=\"star\""), "star sort option missing");
+        assert!(html.contains("value=\"med\""), "median sort option missing");
+        for gone in ["value=\"frac\"", "value=\"sig\"", "value=\"q\""] {
+            assert!(
+                !html.contains(gone),
+                "sort option {gone} should have been removed"
+            );
+        }
+        assert!(
+            html.contains("b.star_signal - a.star_signal"),
+            "the default client sort must be the star tail"
+        );
+        assert!(
+            html.contains("a.median - b.median"),
+            "median sort must run faintest-first"
+        );
+    }
+
+    /// The top bar is centered like the bottom one; the badge shows the
+    /// total marked count, hides itself at zero, and sits at the end of the
+    /// bar. The current frame's MARKED/UNMARKED label and the yellow meta
+    /// line live on the file-name line.
+    #[test]
+    fn review_page_badge_counts_marks_and_meta_shows_frame_status() {
+        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        assert!(
+            html.contains("justify-content: center; flex-wrap: wrap; z-index: 5;"),
+            "the top bar must be centered like the bottom bar"
+        );
+        // Count badge, hidden when nothing is marked, last child of the bar.
+        assert!(
+            html.contains("b.textContent = n + \" marked\";")
+                && html.contains("b.style.display = n ? \"\" : \"none\";"),
+            "the badge must count marks and hide at zero"
+        );
+        let bar = &html[..html.find("<div id=\"stage\">").expect("stage")];
+        let badge_at = bar.find("id=\"badge\"").expect("badge in the bar");
+        let sort_at = bar.find("id=\"sort\"").expect("sort in the bar");
+        assert!(badge_at > sort_at, "the badge must sit at the end of the bar");
+        // Per-frame status on the meta line, yellow when marked.
+        assert!(
+            html.contains("st.textContent = m ? \"MARKED\" : \"UNMARKED\";")
+                && html.contains("$(\"meta\").style.color = m ? \"#FFD700\" : \"\";"),
+            "the meta line must label the frame status and turn yellow when marked"
+        );
+        assert!(
+            html.contains("<span id=\\\"mstat\\\"></span>"),
+            "the meta line must carry the status span"
+        );
+    }
+
+    /// Marked files wear a yellow ring around the filter-colour frame. It is
+    /// driven from `setBadge`, so every mark change repaints it.
+    #[test]
+    fn review_page_frames_marked_files_with_a_yellow_outer_border() {
+        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        assert!(
+            html.contains("$(\"img\").style.outline = m ? \"3px solid #FFD700\" : \"none\";"),
+            "marked files must get a yellow ring around the filter border"
         );
     }
 }

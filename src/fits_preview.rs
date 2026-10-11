@@ -358,19 +358,34 @@ pub struct Stats {
     pub p99_99: f32,
     pub max: f32,
     pub n: usize,
+    /// Fraction of **unclipped** pixels above `median + 5σ`: how much of the
+    /// frame is stars. ≈ 0 for a bare sky, clearly positive for a field.
+    pub star_frac: f32,
+    /// `(p99.99 − median) / σ`: how far the bright tail reaches, in units of
+    /// sky noise. Stars, planes and satellites all raise it; `star_frac`
+    /// separates a real field from a single streak.
+    pub star_signal: f32,
 }
 
 impl Stats {
     /// Cheap noise-based quality metric; higher is better (more sky signal per
     /// unit noise, i.e. closer to shot-noise limited).
     ///
-    /// Blind spot: it cannot see tracking failures or star trailing.
+    /// Blind spot: it cannot see stars at all — sigma-clipping removes them as
+    /// outliers — and it cannot see tracking failures or star trailing.
     pub fn sky_over_sigma(&self) -> f32 {
         if self.sigma <= 0.0 {
             0.0
         } else {
             self.median / self.sigma
         }
+    }
+
+    /// Composite: many bright outliers, not just one. A bare sky scores ~0;
+    /// a single satellite trail scores low (tiny fraction); a real star
+    /// field scores high. Not the default ranking (that is `star_signal`).
+    pub fn star_score(&self) -> f32 {
+        self.star_frac * self.star_signal
     }
 }
 
@@ -396,10 +411,15 @@ fn clipped_stats(samples: &mut Vec<f32>) -> Stats {
             p99_99: 0.0,
             max: 0.0,
             n: 0,
+            star_frac: 0.0,
+            star_signal: 0.0,
         };
     }
 
     let n = samples.len();
+    // The star metrics need the **unclipped** population, and the clipping
+    // loop below shrinks `samples` in place.
+    let original = samples.clone();
     let mut sorted = samples.clone();
     sorted.sort_by(fcmp);
     let p99_99 = sorted[((n as f64 * 0.9999) as usize).min(n - 1)];
@@ -425,12 +445,21 @@ fn clipped_stats(samples: &mut Vec<f32>) -> Stats {
         }
     }
 
+    let star_thresh = median + 5.0 * sigma;
+    let star_frac = original.iter().filter(|v| **v > star_thresh).count() as f32 / n as f32;
+    let star_signal = if sigma > 0.0 {
+        (p99_99 - median) / sigma
+    } else {
+        0.0
+    };
     Stats {
         median,
         sigma,
         p99_99,
         max,
         n,
+        star_frac,
+        star_signal,
     }
 }
 

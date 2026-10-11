@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use axum::{extract::Form, Router};
 use chrono::Local;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use crate::plan::expand_constellation;
 use crate::render::{
@@ -223,7 +223,8 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/review/manifest", get(review_manifest))
         .route("/review/preview", get(review_preview))
         .route("/review/destinations", get(review_destinations))
-        .route("/review/destfiles", get(review_destfiles))
+        .route("/review/destinfo", get(review_destinfo))
+        .route("/review/mkdir", post(review_mkdir))
         .route("/review/newdest", post(review_newdest))
         .route("/review/apply", post(review_apply))
         .with_state(state)
@@ -1117,32 +1118,105 @@ async fn sweep_once(state: &Arc<AppState>) -> review::SweepReport {
 async fn review_destinations(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<review::Destination>>, (StatusCode, String)> {
-    let roots = state.review_roots.clone();
     if let Some(cached) = state.cached_dests() {
         return Ok(Json(cached));
     }
-    // A bounded read_dir walk, deliberately NOT get_records(): that path takes
-    // a std Mutex across a traverse measured at ~48 s, which would stall every
+    // The dropdown offers children of **every** review root, down to
+    // telescope / object level (`root/tel`, `root/tel/obj`): the roots
+    // themselves and deeper subdirs (`master`, `*.pxiproject`, …) are not
+    // offered. Any other directory inside a root can still be typed into the
+    // destination screen and arrives via `/review/destinfo`. A bounded
+    // read_dir walk, deliberately NOT get_records(): that path takes a
+    // std Mutex across a traverse measured at ~48 s, which would stall every
     // other request.
-    let dirs = tokio::task::spawn_blocking(move || review::list_destinations(&roots, 2_000))
+    let roots = state.review_roots.clone();
+    let dirs = tokio::task::spawn_blocking(move || review::list_destinations(&roots, 2_000, 2))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     state.set_dests(dirs.clone());
     Ok(Json(dirs))
 }
 
-/// Filenames already in a destination, so the UI can flag collisions before
-/// anything is written.
-async fn review_destfiles(
+#[derive(Serialize)]
+struct DestInfo {
+    path: String,
+    exists: bool,
+    files: usize,
+    names: Vec<String>,
+}
+
+/// Facts about a **candidate** destination directory: whether it exists, how
+/// many files it holds, and their names. Unlike the other review routes this
+/// one also accepts a path that does not exist yet (inside a review root),
+/// returning `exists: false` so the UI can offer to create it. Anything
+/// outside every review root is rejected.
+async fn review_destinfo(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ReviewQuery>,
-) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+) -> Result<Json<DestInfo>, (StatusCode, String)> {
     let raw = q.dir.ok_or((StatusCode::BAD_REQUEST, "dir is required".to_string()))?;
-    let dir = state.review_path(&raw)?;
-    let files = tokio::task::spawn_blocking(move || review::dest_files(&dir, 20_000))
+    let cand = review::guard_new_dir(&state.review_roots, &raw)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let exists = cand.is_dir();
+    let names = if exists {
+        review::dest_files(&cand, 20_000)
+    } else {
+        Vec::new()
+    };
+    let files = names.len();
+    Ok(Json(DestInfo {
+        path: cand.to_string_lossy().into_owned(),
+        exists,
+        files,
+        names,
+    }))
+}
+
+#[derive(Deserialize)]
+struct MkdirRequest {
+    dir: String,
+}
+
+/// Create a destination directory inside a review root, at any depth. The
+/// guard runs lexically before creation and the canonicalised result is
+/// re-checked after, so a symlinked component cannot smuggle the new dir out
+/// of the root.
+async fn review_mkdir(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MkdirRequest>,
+) -> Result<Json<review::Destination>, (StatusCode, String)> {
+    let roots = state.review_roots.clone();
+    let roots_for_label = roots.clone();
+    let raw = req.dir.clone();
+    let created = tokio::task::spawn_blocking(move || review::create_dest_dir(&roots, &raw))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(files))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    state.invalidate_dests();
+    state.cache.lock().unwrap().records = None;
+
+    // Label exactly as `list_destinations` does (`root/rel`), so the JS can
+    // select the new option by path without a label mismatch.
+    let label = roots_for_label
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .find_map(|rr| {
+            created.strip_prefix(&rr).ok().map(|rel| {
+                let root_name = rr.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if rel.as_os_str().is_empty() {
+                    root_name
+                } else {
+                    format!("{root_name}/{}", rel.to_string_lossy())
+                }
+            })
+        })
+        .unwrap_or_else(|| created.to_string_lossy().into_owned());
+    Ok(Json(review::Destination {
+        label,
+        name: created.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        path: created.to_string_lossy().into_owned(),
+    }))
 }
 
 async fn review_apply(

@@ -72,8 +72,15 @@ pub struct Frame {
     pub filter: String,
     pub median: f32,
     pub sigma: f32,
-    /// sky/σ — the cheap quality metric. Higher is better.
+    /// sky/σ — the cheap quality metric. Higher is better. Blind to stars.
     pub quality: f32,
+    /// Fraction of pixels above median + 5σ: how much of the frame is stars.
+    pub star_frac: f32,
+    /// (p99.99 − median)/σ: how far the bright tail reaches, in sky-noise units.
+    pub star_signal: f32,
+    /// star_frac × star_signal — composite that penalizes single streaks;
+    /// kept for reference, the default ranking uses star_signal alone.
+    pub star_score: f32,
     pub width: u32,
     pub height: u32,
     pub exptime: Option<f64>,
@@ -239,6 +246,9 @@ fn scan_frame(p: &Path, dir: &Path) -> Result<Frame, String> {
         median: s.median,
         sigma: s.sigma,
         quality: s.sky_over_sigma(),
+        star_frac: s.star_frac,
+        star_signal: s.star_signal,
+        star_score: s.star_score(),
         width: h.width as u32,
         height: h.height as u32,
         exptime: h.exptime,
@@ -277,10 +287,11 @@ pub fn scan(dir: &Path) -> Manifest {
     let mut groups: Vec<Group> = buckets
         .into_iter()
         .map(|((imagetype, filter), mut frames)| {
-            // Best first by default; the client can re-sort by median/sigma.
+            // Star tail first by default; the client can re-sort by the
+            // other metrics.
             frames.sort_by(|a, b| {
-                b.quality
-                    .partial_cmp(&a.quality)
+                b.star_signal
+                    .partial_cmp(&a.star_signal)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             Group { imagetype, filter, frames }
@@ -418,6 +429,63 @@ pub fn resolve_within_any(roots: &[PathBuf], raw: &str) -> Result<PathBuf, Strin
         }
     }
     Err(last.unwrap_or_else(|| format!("no review roots configured: {raw}")))
+}
+
+/// Collapse `.` and `..` in a path **lexically**, without touching the
+/// filesystem — the only normalisation possible for a path that does not
+/// exist yet. A leading `..` that would climb past `/` is clamped by the
+/// `RootDir` component resetting the accumulator.
+fn normalize_lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Accept `raw` only if its lexical form lands strictly inside one of the
+/// `roots`. Used for destination paths that may not exist yet, where
+/// `resolve_within`'s canonicalise-the-parent trick cannot run. A root
+/// itself is never a destination.
+pub fn guard_new_dir(roots: &[PathBuf], raw: &str) -> Result<PathBuf, String> {
+    let cand = normalize_lexical(Path::new(raw));
+    let mut last = "no review roots configured".to_string();
+    for r in roots {
+        let Ok(root_real) = fs::canonicalize(r) else { continue };
+        if cand == root_real {
+            last = format!("a review root is not a destination: {raw}");
+            continue;
+        }
+        if cand.starts_with(&root_real) {
+            return Ok(cand);
+        }
+        last = format!("path is outside {}: {raw}", root_real.display());
+    }
+    Err(last)
+}
+
+/// Create a new destination directory inside a review root. The path is
+/// checked lexically first (it does not exist yet, so it cannot be
+/// canonicalised), then **re-checked after creation**: a symlinked component
+/// along the way could otherwise land the new directory outside the root.
+pub fn create_dest_dir(roots: &[PathBuf], raw: &str) -> Result<PathBuf, String> {
+    let cand = guard_new_dir(roots, raw)?;
+    fs::create_dir_all(&cand).map_err(|e| format!("create {}: {e}", cand.display()))?;
+    let real = fs::canonicalize(&cand).map_err(|e| format!("resolve {}: {e}", cand.display()))?;
+    let inside = roots
+        .iter()
+        .filter_map(|r| fs::canonicalize(r).ok())
+        .any(|rr| real.starts_with(&rr));
+    if !inside {
+        return Err(format!("created path escapes the review roots: {raw}"));
+    }
+    Ok(real)
 }
 
 // --- Apply ------------------------------------------------------------------
@@ -675,9 +743,11 @@ pub fn list_review_dirs(roots: &[PathBuf], cap: usize) -> Vec<ReviewDir> {
     out
 }
 
-/// Every directory under `roots`, offered as an action destination. Basenames
-/// are matched against the reviewed directory's basename to suggest a default.
-pub fn list_destinations(roots: &[PathBuf], cap: usize) -> Vec<Destination> {
+/// Children of `roots`, offered as an action destination, down to `max_depth`
+/// levels below each root (`root/telescope`, `root/telescope/object`). The
+/// root itself is never offered. Basenames are matched against the reviewed
+/// directory's basename to suggest a default.
+pub fn list_destinations(roots: &[PathBuf], cap: usize, max_depth: usize) -> Vec<Destination> {
     let mut out = Vec::new();
     for root in roots {
         let root_real = match fs::canonicalize(root) {
@@ -689,7 +759,23 @@ pub fn list_destinations(roots: &[PathBuf], cap: usize) -> Vec<Destination> {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let mut stack = vec![(root_real.clone(), 0usize)];
+        // Seed the walk with the root's children: the root itself is not a
+        // destination, so depth starts at 1.
+        let mut stack: Vec<(PathBuf, usize)> = Vec::new();
+        if max_depth > 0 {
+            if let Ok(entries) = fs::read_dir(&root_real) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    if e.file_name().to_string_lossy().starts_with('.') {
+                        continue;
+                    }
+                    stack.push((p, 1usize));
+                }
+            }
+        }
         let mut visited = 0usize;
         let mut per_root = Vec::new();
         while let Some((d, depth)) = stack.pop() {
@@ -698,17 +784,12 @@ pub fn list_destinations(roots: &[PathBuf], cap: usize) -> Vec<Destination> {
             }
             visited += 1;
             let rel = d.strip_prefix(&root_real).unwrap_or(Path::new(""));
-            let label = if rel.as_os_str().is_empty() {
-                root_name.clone()
-            } else {
-                format!("{root_name}/{}", rel.to_string_lossy())
-            };
             per_root.push(Destination {
-                label,
+                label: format!("{root_name}/{}", rel.to_string_lossy()),
                 name: d.file_name().unwrap_or_default().to_string_lossy().to_string(),
                 path: d.to_string_lossy().to_string(),
             });
-            if depth >= MAX_WALK_DEPTH {
+            if depth >= max_depth {
                 continue;
             }
             let Ok(entries) = fs::read_dir(&d) else { continue };
@@ -865,6 +946,35 @@ mod tests {
         );
         fs::remove_dir_all(&staging).ok();
         fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[test]
+    fn guard_new_dir_accepts_new_paths_inside_a_root() {
+        let root = fs::canonicalize(tmpdir("guardnew")).unwrap();
+        fs::create_dir_all(root.join("tel")).unwrap();
+        let inside = root.join("tel/New Object");
+        assert!(guard_new_dir(&roots(&[&root]), inside.to_str().unwrap()).is_ok());
+        // dot-dot smuggling must be rejected even though every component
+        // except the last exists.
+        let escape = root.join("tel").join("..").join("..").join("outside");
+        assert!(guard_new_dir(&roots(&[&root]), escape.to_str().unwrap()).is_err());
+        // A root itself is never a destination.
+        assert!(guard_new_dir(&roots(&[&root]), root.to_str().unwrap()).is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn create_dest_dir_makes_the_directory_and_rejects_escapes() {
+        let root = fs::canonicalize(tmpdir("mkdir")).unwrap();
+        fs::create_dir_all(root.join("81GT")).unwrap();
+        let d = root.join("81GT/New Obj");
+        let made = create_dest_dir(&roots(&[&root]), d.to_str().unwrap()).unwrap();
+        assert!(made.is_dir(), "the directory must be created");
+        // An escape must be refused **and** left uncreated.
+        let nope = root.join("../nope");
+        assert!(create_dest_dir(&roots(&[&root]), nope.to_str().unwrap()).is_err());
+        assert!(!nope.exists());
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1073,15 +1183,17 @@ mod tests {
     }
 
     #[test]
-    fn scan_groups_by_imagetype_and_filter_and_ranks_by_quality() {
+    fn scan_groups_by_imagetype_and_filter_and_ranks_by_star_signal() {
         // Reuse the synthetic FITS builder from fits_preview via a minimal
         // hand-written file: two Lights (H, R) and one Dark.
         let dir = tmpdir("scan");
         fs::create_dir_all(&dir).unwrap();
-        write_fake_fits(&dir.join("L_H_1.fits"), 310.0, 13.0);
-        write_fake_fits(&dir.join("L_H_2.fits"), 310.0, 26.0); // worse quality
-        write_fake_fits(&dir.join("L_R_1.fits"), 310.0, 13.0);
-        write_fake_fits(&dir.join("Dark_1.fits"), 310.0, 13.0);
+        // Same sky and noise for both Ha lights: only the stars differ, so
+        // the default ranking can only be star-driven.
+        write_fake_fits(&dir.join("L_H_1.fits"), 310.0, 13.0, 300);
+        write_fake_fits(&dir.join("L_H_2.fits"), 310.0, 13.0, 0); // bare sky
+        write_fake_fits(&dir.join("L_R_1.fits"), 310.0, 13.0, 0);
+        write_fake_fits(&dir.join("Dark_1.fits"), 310.0, 13.0, 0);
 
         let m = scan(&dir);
         assert_eq!(m.scanned, 4, "{:?}", m.errors);
@@ -1095,11 +1207,16 @@ mod tests {
         let gh = m.groups.iter().find(|g| g.filter == "Ha").unwrap();
         assert_eq!(gh.frames.len(), 2);
         assert!(
-            gh.frames[0].quality > gh.frames[1].quality,
-            "best frame must sort first: {} vs {}",
-            gh.frames[0].quality,
-            gh.frames[1].quality
+            gh.frames[0].star_signal > gh.frames[1].star_signal,
+            "star field must outrank bare sky: {} vs {}",
+            gh.frames[0].star_signal,
+            gh.frames[1].star_signal
         );
+        let starry = gh.frames.iter().find(|f| f.name.starts_with("L_H_1")).unwrap();
+        let bare = gh.frames.iter().find(|f| f.name.starts_with("L_H_2")).unwrap();
+        assert!(starry.star_frac > 0.005, "stars must be seen: {}", starry.star_frac);
+        assert!(bare.star_frac < 1e-4, "pure noise must not fake stars: {}", bare.star_frac);
+        assert!(bare.star_score < 1e-3, "bare sky must score ~0: {}", bare.star_score);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1107,7 +1224,7 @@ mod tests {
     fn scan_includes_calibration_directories() {
         let dir = tmpdir("calib");
         fs::create_dir_all(dir.join("Darks")).unwrap();
-        write_fake_fits(&dir.join("Darks/d1.fits"), 310.0, 13.0);
+        write_fake_fits(&dir.join("Darks/d1.fits"), 310.0, 13.0, 0);
         let m = scan(&dir);
         assert_eq!(m.scanned, 1, "calibration frames are reviewable too");
         fs::remove_dir_all(&dir).ok();
@@ -1176,18 +1293,24 @@ mod tests {
     }
 
     #[test]
-    fn destinations_cover_every_root_and_label_by_root() {
+    fn destinations_are_children_of_every_root_labelled_by_root() {
         let a = tmpdir("dest_a");
         let b = tmpdir("dest_b");
         fs::create_dir_all(a.join("81GT/M42")).unwrap();
+        fs::create_dir_all(a.join("81GT/M42/master")).unwrap();
         fs::create_dir_all(b.join("Pier/Jacoby1")).unwrap();
-        let ds = list_destinations(&roots(&[&a, &b]), 100);
+        let ds = list_destinations(&roots(&[&a, &b]), 100, 2);
         let labels: Vec<&str> = ds.iter().map(|d| d.label.as_str()).collect();
         let an = a.file_name().unwrap().to_string_lossy().to_string();
         let bn = b.file_name().unwrap().to_string_lossy().to_string();
         assert!(labels.contains(&format!("{an}/81GT/M42").as_str()), "{labels:?}");
         assert!(labels.contains(&format!("{bn}/Pier/Jacoby1").as_str()), "{labels:?}");
-        assert!(labels.contains(&an.as_str()), "the root itself is a destination");
+        assert!(
+            labels.contains(&format!("{an}/81GT").as_str()),
+            "telescope level must be offered: {labels:?}"
+        );
+        assert!(!labels.contains(&an.as_str()), "the root itself is not a destination: {labels:?}");
+        assert!(!labels.iter().any(|l| l.ends_with("/master")), "deeper dirs must not appear: {labels:?}");
         // Labels sort, so the dropdown is stable.
         let mut sorted = labels.clone();
         sorted.sort();
@@ -1213,7 +1336,7 @@ mod tests {
 
     /// Minimal single-HDU BITPIX=16 FITS with a flat sky, enough for the header
     /// parser and the strided stats pass.
-    fn write_fake_fits(path: &Path, sky: f32, sigma: f32) {
+    fn write_fake_fits(path: &Path, sky: f32, sigma: f32, stars: usize) {
         let (w, h) = (64usize, 64usize);
         let mut hdr = String::new();
         let mut card = |k: &str, v: &str| {
@@ -1246,11 +1369,18 @@ mod tests {
         }
         let mut bytes = hdr.into_bytes();
         let mut state = 12345u64;
-        for _y in 0..h {
-            for _x in 0..w {
+        // Deterministic star positions, well clear of the 5σ threshold.
+        let mut star_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        while star_at.len() < stars {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            star_at.insert((state >> 33) as usize % (w * h));
+        }
+        for y in 0..h {
+            for x in 0..w {
                 state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let n = (((state >> 33) as f32) / ((1u64 << 31) as f32) - 0.5) * 2.0 * sigma;
-                let v = ((sky + n - 32768.0).round() as i32).clamp(-32768, 32767) as i16;
+                let signal = if star_at.contains(&(y * w + x)) { 200.0 * sigma } else { 0.0 };
+                let v = ((sky + signal + n - 32768.0).round() as i32).clamp(-32768, 32767) as i16;
                 bytes.extend_from_slice(&v.to_be_bytes());
             }
         }
