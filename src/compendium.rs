@@ -190,6 +190,7 @@ pub fn render_compendium_page(data_available: bool, observer: Observer, when: &s
     };
     COMPENDIUM_HTML
         .replace("{{HINT}}", &hint)
+        .replace("{{NAVBAR}}", &crate::nav::render_navbar("compendium"))
         .replace("{{LAT}}", &format!("{:.4}", observer.latitude))
         .replace("{{LON}}", &format!("{:.4}", observer.longitude))
         .replace("{{WHEN}}", when)
@@ -202,9 +203,13 @@ const COMPENDIUM_HTML: &str = r##"<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Deep Sky Compendium</title>
 <style>
-body { font-family: system-ui, sans-serif; margin: 1em; background: #11151c; color: #dde3ea; }
+body { font-family: Inter, system-ui, sans-serif; margin: 0; padding: 2em; background: #11151c; color: #dde3ea; }
 h1 { font-size: 1.4em; margin-bottom: .2em; }
 a { color: #7db8ff; }
+.topnav { margin: 0 0 1em; font-size: .95em; }
+.topnav a { color: #7c8cff; text-decoration: none; }
+.topnav a:hover { text-decoration: underline; }
+.topnav .cur { color: #dde3ea; font-weight: 700; }
 .meta { color: #9aa7b5; font-size: .9em; margin-top: 0; }
 .hint { background: #3a2f14; border: 1px solid #8a6d1a; padding: .6em 1em; border-radius: 6px; margin: .8em 0; }
 #filters { display: flex; flex-wrap: wrap; gap: .6em; align-items: center; margin: .8em 0; position: sticky; top: 0; background: #11151c; padding: .4em 0; z-index: 2; }
@@ -237,8 +242,9 @@ img.thumb { width: 64px; height: 48px; object-fit: cover; border-radius: 4px; ba
 </style>
 </head>
 <body>
+{{NAVBAR}}
 <h1>Deep Sky Compendium</h1>
-<p class="meta"><a href="/">&larr; Inventory</a> &middot; Imm Deep Sky Compendium &mdash; 2026 &mdash; 6th Edition</p>
+<p class="meta">Imm Deep Sky Compendium &mdash; 2026 &mdash; 6th Edition</p>
 {{HINT}}
 <div id="filters">
   <input type="search" id="q" placeholder="Search name / nickname / notes / catalogue id...">
@@ -474,6 +480,25 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') $('detail').
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_carries_the_global_navbar() {
+        let html = render_compendium_page(
+            false,
+            Observer {
+                latitude: 0.0,
+                longitude: 0.0,
+            },
+            "now",
+        );
+        assert!(html.contains("<nav class=\"topnav\">"), "navbar missing");
+        assert!(
+            html.contains("<span class=\"cur\">Compendium</span>"),
+            "Compendium should be the active section"
+        );
+        assert!(html.contains("href=\"/staging\""), "Staging link missing");
+        assert!(!html.contains("{{NAVBAR}}"), "placeholder left unsubstituted");
+    }
 
     #[test]
     fn sanitize_replaces_non_alphanumeric() {

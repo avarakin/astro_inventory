@@ -79,6 +79,11 @@ struct Config {
     review_roots: Option<Vec<PathBuf>>,
     nav_repeat_ms: Option<u64>,
     preview_sweep_min: Option<u64>,
+    /// Staging telescope name -> inventory telescope name. Staging folders are
+    /// named after the mount (Pier, RC); the CCD tree names them per instrument
+    /// (10RC, Esprit100). The map lets the move screen scope and preselect the
+    /// right destination telescope despite the mismatch.
+    staging_tel_map: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Precedence: CLI flag > config file > built-in default.
@@ -139,6 +144,7 @@ fn main() -> anyhow::Result<()> {
     // 5 min: a full pass over 1,283 staging files renders the ~450 missing
     // previews in ~2 minutes, so a pass is cheap and the interval is not.
     let preview_sweep_min = pick(cli.preview_sweep_min, cfg.preview_sweep_min, 5u64);
+    let tel_map = cfg.staging_tel_map.unwrap_or_default();
     // The CCD root and staging are always reviewable; config/CLI add more.
     let mut review_roots: Vec<PathBuf> = cli.review_roots;
     for r in cfg.review_roots.unwrap_or_default() {
@@ -192,6 +198,7 @@ fn main() -> anyhow::Result<()> {
         cache_dir,
         review_roots,
         nav_repeat_ms,
+        tel_map,
     );
 
     let sweep_state = state.clone();
@@ -215,7 +222,7 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::config_path_in;
+    use super::{config_path_in, Config};
     use std::fs;
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -276,5 +283,19 @@ mod tests {
         let e = config_path_in(&d, Some(&missing)).unwrap_err().to_string();
         assert!(e.contains("does not exist"), "{e}");
         fs::remove_dir_all(&d).ok();
+    }
+
+    /// The staging->inventory telescope mapping parses out of the config file;
+    /// absent it, the map is empty and hints fall back to name equality.
+    #[test]
+    fn staging_tel_map_is_parsed_from_config() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"staging_tel_map": {"Pier": "10RC", "RC": "8RC"}}"#)
+                .unwrap();
+        let m = cfg.staging_tel_map.unwrap();
+        assert_eq!(m.get("Pier").map(String::as_str), Some("10RC"));
+        assert_eq!(m.get("RC").map(String::as_str), Some("8RC"));
+        let empty: Config = serde_json::from_str("{}").unwrap();
+        assert!(empty.staging_tel_map.unwrap_or_default().is_empty());
     }
 }

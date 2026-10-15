@@ -1,5 +1,6 @@
 use crate::plan::html_escape;
 use crate::traverse::ObjectRecord;
+use astro_inventory::nav::render_navbar;
 use chrono::{Local, TimeZone};
 use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
@@ -38,6 +39,11 @@ pub const CSS: &str = r#"
     color: var(--text);
   }
   h1 { font-size: 1.6em; font-weight: 700; letter-spacing: 0.3px; margin: 0 0 0.5em; }
+  /* Global section links, rendered by `render_navbar` on every page. */
+  .topnav { margin: 0 0 1em; font-size: .95em; }
+  .topnav a { color: var(--accent); text-decoration: none; }
+  .topnav a:hover { text-decoration: underline; }
+  .topnav .cur { color: var(--text); font-weight: 700; }
   a { color: var(--accent); }
   .meta { color: var(--muted); margin-bottom: 1.2em; font-size: 14px; }
   .meta a { text-decoration: none; }
@@ -344,8 +350,6 @@ pub fn render_index_page(
     header_cells: &str,
     rows: &str,
     pager: &str,
-    // Pre-rendered nav fragment; empty when staging review is disabled.
-    staging_nav: &str,
 ) -> String {
     format!(
         r#"<!DOCTYPE html>
@@ -356,9 +360,10 @@ pub fn render_index_page(
 <style>{css}</style>
 </head>
 <body>
+{navbar}
 <h1>Astro Imaging Tracker</h1>
 <p class="meta">Root: {root} &middot; Location: {location} &middot; Objects: {n} &middot; Generated: {gen}<br>
-Click a column header to sort. <a href="{refresh_url}">Refresh scan</a> &middot; <a href="/compendium">Compendium</a>{staging_nav}</p>
+Click a column header to sort. <a href="{refresh_url}">Refresh scan</a></p>
 
 <div class="addbox">
   <h2>Add a new object:</h2>
@@ -384,6 +389,12 @@ Click a column header to sort. <a href="{refresh_url}">Refresh scan</a> &middot;
     <button type="submit">Add</button>
   </form>
   <script>
+  // Server-side the name is normalised to ASCII alphanumerics (`/` kept as the
+  // nesting separator); mirror that here so the user sees the final name.
+  // NFD decomposition turns é into e + a combining mark, which the strip removes.
+  function normName(s) {{ return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/Æ/g, "AE").replace(/æ/g, "ae").replace(/ß/g, "ss").replace(/ẞ/g, "SS").replace(/Ð/g, "D").replace(/ð/g, "d").replace(/Đ/g, "D").replace(/đ/g, "d").replace(/Ď/g, "D").replace(/ď/g, "d").replace(/Ø/g, "O").replace(/ø/g, "o").replace(/Ř/g, "R").replace(/ř/g, "r").replace(/Ł/g, "L").replace(/ł/g, "l").split("/").map(function(seg) {{ return seg.replace(/[^A-Za-z0-9]/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, ""); }}).join("/"); }}
+  var objInput = document.getElementById('object');
+  objInput.addEventListener('blur', function() {{ objInput.value = normName(objInput.value.trim()); }});
   document.getElementById('populate-btn').addEventListener('click', function() {{
     var link = document.getElementById('sample').value.trim();
     if (!link) {{ alert('Please enter an AstroBin link first.'); return; }}
@@ -395,7 +406,7 @@ Click a column header to sort. <a href="{refresh_url}">Refresh scan</a> &middot;
       .then(function(res) {{
         if (!res.ok) throw new Error(res.data.error || 'Lookup failed');
         var d = res.data;
-        if (d.name) document.getElementById('object').value = d.name;
+        if (d.name) document.getElementById('object').value = normName(d.name);
         if (d.constellation) document.getElementById('constellation').value = d.constellation;
         if (d.ra) document.getElementById('ra').value = d.ra;
         if (d.dec) document.getElementById('dec').value = d.dec;
@@ -434,7 +445,7 @@ Click a column header to sort. <a href="{refresh_url}">Refresh scan</a> &middot;
         pager = pager,
         header_cells = header_cells,
         rows = rows,
-        staging_nav = staging_nav,
+        navbar = render_navbar("inventory"),
     )
 }
 
@@ -455,6 +466,7 @@ pub fn render_edit_page(
 <style>{css}</style>
 </head>
 <body>
+{navbar}
 {flashes}
 <h1>Edit plan: {telescope}/{name}</h1>
 <p class="meta">{plan_path}</p>
@@ -474,6 +486,7 @@ pub fn render_edit_page(
         plan_path = html_escape(plan_path),
         content = html_escape(content),
         flashes = flashes,
+        navbar = render_navbar("inventory"),
     )
 }
 
@@ -523,8 +536,9 @@ pub fn render_review_index(roots: &[std::path::PathBuf], dirs: &[crate::review::
 <style>__CSS__</style>
 </head>
 <body>
+__NAVBAR__
 <h1>Review directories</h1>
-<p class="meta">Roots: __ROOTS__ &middot; <a href="/">Inventory</a> &middot; <a href="/compendium">Compendium</a> &middot; <a href="/staging">Staging</a></p>
+<p class="meta">Roots: __ROOTS__</p>
 <p class="meta">Pick <strong>one</strong> directory. The review never touches a whole root.</p>
 <table id="dirs">
 <thead><tr>
@@ -573,6 +587,7 @@ __ROWS__
 </body>
 </html>"####;
     html.replace("__CSS__", CSS)
+        .replace("__NAVBAR__", &render_navbar("staging"))
         .replace("__ROOTS__", &html_escape(&roots_txt))
         .replace("__ROWS__", &rows)
 }
@@ -605,7 +620,13 @@ pub fn human_bytes(n: u64) -> String {
 ///
 /// `nav_repeat_ms` is the autorepeat throttle for the arrow keys, injected from
 /// config so the scroll rate is tunable without touching the page.
-pub fn render_review(dir: &str, nav_repeat_ms: u64) -> String {
+pub fn render_review(
+    dir: &str,
+    nav_repeat_ms: u64,
+    tel_only: Option<&[String]>,
+    suggest_tel: Option<&str>,
+    staging: bool,
+) -> String {
     let html = r####"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -616,8 +637,10 @@ __CSS__
 body { margin: 0; background: #111; color: #ddd; }
 #bar { position: sticky; top: 0; background: #1b1b1b; border-bottom: 1px solid #333;
        padding: 8px 12px; display: flex; gap: 12px; align-items: center;
-       justify-content: center; flex-wrap: wrap; z-index: 5; font-size: 13px; }
-#bar a { color: #8cf; text-decoration: none; }
+       justify-content: center; flex-wrap: wrap; z-index: 5; font-size: .95em; }
+#bar a { color: var(--accent); text-decoration: none; }
+/* The shared navbar needs no override here: the shared body padding gives
+   the same 2em inset as every other page. */
 #dir { font-weight: 600; word-break: break-all; }
 .badge { padding: 2px 8px; border-radius: 3px; font-size: 12px; font-weight: 700; }
 .b-mark { background: #2c6e49; color: #fff; }
@@ -628,7 +651,7 @@ body { margin: 0; background: #111; color: #ddd; }
        gap: 12px; justify-content: center; z-index: 5; }
 #img { max-width: 100%; max-height: 76vh; background: #000; border: 1px solid #333; }
 #meta { font-size: 12px; color: #999; margin-top: 8px; word-break: break-all; }
-#grp { color: #8cf; font-weight: 600; }
+#grp { color: var(--accent); font-weight: 600; }
 #overlay { position: fixed; inset: 0; background: #111; display: none;
            overflow: auto; padding: 20px 24px; z-index: 10; }
 #overlay.show { display: block; }
@@ -637,25 +660,31 @@ body { margin: 0; background: #111; color: #ddd; }
 #dstscreen.show { display: block; }
 #dstinfo { font-size: 13px; margin: 12px 0 16px; }
 #dstinfo ul { margin: 4px 0 8px 18px; }
-#dstpath { background: #222; color: #ddd; border: 1px solid #444; padding: 4px; }
 table { border-collapse: collapse; width: 100%; font-size: 12px; margin: 8px 0 16px; }
 td, th { padding: 4px 8px; border-bottom: 1px solid #2a2a2a; text-align: left; }
 td.num { text-align: right; }
 .col { color: #f88; }
-/* One uniform style for every button; the only variation is the disabled
-   state. The selected operation is tracked by the `active` class alone — it
-   carries no styling, so every button looks identical. */
+/* One uniform style for every button; the only variations are the disabled
+   state and the destructive Apply/Confirm buttons, which read red. The
+   selected operation is tracked by the `active` class alone — it carries no
+   styling. */
 button { padding: 6px 14px; background: #333; border: 0; color: #fff;
          cursor: pointer; border-radius: 3px; font-size: 13px; }
 button:disabled { color: #777; cursor: default; }
+/* The one deliberate exception: the destructive Apply/Confirm buttons on the
+   confirmation surfaces read red. */
+#btnApply, #btnConfirm { background: #8b2635; }
+#btnApply:hover, #btnConfirm:hover { background: #a52f44; }
 select { background: #222; color: #ddd; border: 1px solid #444; padding: 4px; max-width: 320px; }
 #newname { background: #222; color: #ddd; border: 1px solid #444; padding: 4px; }
 #load { color: #9ab; padding: 30px; }
+.prog { height: 10px; background: #222; border: 1px solid #444; margin: .5em 0; max-width: 420px; }
+.probar { height: 100%; width: 0%; background: var(--accent); transition: width .3s; }
 </style>
 </head>
 <body data-dir="__DIR__" data-repeat="__REPEAT__">
+__NAVBAR__
 <div id="bar">
-  <a href="/review">&larr; directories</a>
   <span id="dir">__DIR__</span>
   <span id="counter"></span>
   <span id="grp"></span>
@@ -690,6 +719,9 @@ select { background: #222; color: #ddd; border: 1px solid #444; padding: 4px; ma
 <div id="overlay">
   <h2>Confirm</h2>
   <div id="sum"></div>
+  <div id="rmsrcrow2">
+    <label><input id="rmsrcdel" type="checkbox" title="After the files are deleted, remove the now-empty directory (kept if it still holds files)"> delete directory once files are deleted</label>
+  </div>
   <button id="btnApply" disabled title="Apply the operation to the marked files — press twice to confirm">Apply</button>
   <button id="btnClose" class="plain" title="Close this panel and return to the slideshow (shortcut: Esc)">Close (Esc)</button>
   <div id="result"></div>
@@ -697,26 +729,31 @@ select { background: #222; color: #ddd; border: 1px solid #444; padding: 4px; ma
 <div id="dstscreen">
   <h2 id="dsttitle">Destination</h2>
   <div id="dstpick">
-    <label>destination <select id="dest" title="Pick an existing destination directory"></select></label>
-    <input id="dstpath" type="text" size="30" placeholder="or type any directory path under a review root" title="Type any directory path under a review root, then press Go or Enter">
-    <button id="btnGo" class="plain" title="Look up the typed path and make it the destination">Go</button>
-    <button id="btnNewOpen" class="plain" title="Create a new object directory under an existing telescope">＋ Create new directory</button>
-  </div>
-  <div id="newrow" style="display:none">
-    <select id="newtel" title="Parent telescope for the new directory"></select>
-    <input id="newname" type="text" size="18" placeholder="object name" title="Name of the new object directory">
-    <button id="btnNew" title="Create the new directory and select it as the destination">Create</button>
-    <button id="btnNewCancel" class="plain" title="Cancel creating a new directory">Cancel</button>
+    <select id="tel" title="Telescope containing the destination directory"></select>
+    <span id="drill"></span>
+    <input id="newname" type="text" size="18" placeholder="new folder name" title="Create a new folder here: type a name and press Create or Enter">
+    <button id="btnNew" title="Create the new folder at the drilled location and select it as the destination">Create</button>
     <span id="newmsg" class="col" style="display:none"></span>
   </div>
   <div id="dstinfo"></div>
+  <div id="rmsrcrow" style="display:none">
+    <label><input id="rmsrc" type="checkbox" title="After the move finishes, remove the now-empty source directory (kept if it still holds files)"> remove source directory once move is complete</label>
+  </div>
   <button id="btnConfirm" disabled title="Perform the operation on the marked files — press twice to confirm">Confirm</button>
   <button id="btnDstBack" class="plain" title="Return to the slideshow without doing anything (shortcut: Esc)">Back (Esc)</button>
   <div id="dstresult"></div>
+  <div id="filelist"></div>
 </div>
 <script>
 "use strict";
 const DIR = document.body.dataset.dir;
+// Staging-move hints, embedded by the server (null for ordinary review
+// directories). TEL_ONLY restricts the telescope select to the real
+// telescope folders (staging's Syncthing children); SUGGEST_TEL preselects
+// the telescope the reviewed directory itself belongs to.
+const TEL_ONLY = __TELONLY__;
+const SUGGEST_TEL = __SUGGEST__;
+const IS_STAGING = __STAGING__;
 // Autorepeat throttle, from config: a held arrow scrolls at 1000/ms frames per
 // second. Marks must never machine-gun, so only the nav keys honour repeat.
 const REPEAT_MS = parseInt(document.body.dataset.repeat, 10) || 500;
@@ -886,6 +923,10 @@ function renderSummary() {
   }
   $("sum").innerHTML = h;
   $("result").textContent = "";
+  // The directory tidy-up can only succeed when the selection drains the
+  // directory — hide the checkbox whenever images would be left behind.
+  $("rmsrcrow2").style.display =
+    o === "delete" && sel.length && sel.length === frames.length ? "" : "none";
   // Only Delete is applied from this overlay; the other three operations are
   // confirmed on the destination screen.
   const btn = $("btnApply");
@@ -899,6 +940,9 @@ async function applyAll() {
   const btn = $("btnApply");
   const sel = markedFiles();
   const o = curOp();
+  // Nothing marked means nothing to POST: restate the summary instead, which
+  // also disarms the button (a stale armed button would fire an empty apply).
+  if (!sel.length) { renderSummary(); return; }
   // Two-step confirm: the summary states the operation and the quantity, and
   // the button repeats them on the confirm press.
   if (btn.dataset.armed !== "1") {
@@ -908,7 +952,9 @@ async function applyAll() {
     return;
   }
   btn.disabled = true;
-  const body = { dir: DIR, op: o, dst: null, files: sel.map((f) => f.path) };
+  const body = { dir: DIR, op: o, dst: null, files: sel.map((f) => f.path),
+    remove_src_dir: $("rmsrcdel").checked };
+  const stopProg = startProgress($("result"));
   let rep;
   try {
     const r = await fetch("/review/apply", {
@@ -916,13 +962,18 @@ async function applyAll() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    rep = await r.json();
-    if (typeof rep !== "object") rep = { moved: 0, copied: 0, linked: 0, deleted: 0, errors: [String(rep)] };
+    const txt = await r.text();
+    try {
+      rep = JSON.parse(txt);
+      if (typeof rep !== "object") rep = { moved: 0, copied: 0, linked: 0, deleted: 0, errors: [String(rep)] };
+    } catch { rep = { moved: 0, copied: 0, linked: 0, deleted: 0, errors: [txt || ("HTTP " + r.status)] }; }
   } catch (e) {
+    stopProg();
     $("result").textContent = "Apply failed: " + e;
     btn.disabled = false;
     return;
   }
+  stopProg();
   for (const f of sel) delete marks[f.path];
   saveMarks();
   let h = "<p>Moved " + rep.moved + ", copied " + rep.copied + ", symlinked "
@@ -932,29 +983,55 @@ async function applyAll() {
     for (const e of rep.errors) h += "<li class=col>" + e + "</li>";
     h += "</ul>";
   }
-  $("result").innerHTML = h;
   // Re-fetch the now-drained directory rather than trusting local state.
-  const m = await (await fetch("/review/manifest?dir=" + encodeURIComponent(DIR))).json();
-  manifest = m; flat(); show();
-  await onDest();
-  btn.disabled = false;
+  // Best-effort: a refresh hiccup must not hide the outcome or the return.
+  try {
+    const m = await (await fetch("/review/manifest?dir=" + encodeURIComponent(DIR))).json();
+    manifest = m; flat(); show();
+    await onDest();
+  } catch {}
+  // Restate the summary against the new state — this disarms Apply and
+  // disables it when nothing is left marked — then show the outcome.
+  renderSummary();
+  $("result").innerHTML = h;
+  // A completed delete from staging: give the user two seconds to read the
+  // outcome, then hand them back to a freshly loaded staging index.
+  if (IS_STAGING && rep.deleted && !(rep.errors && rep.errors.length)) backToStaging($("result"));
 }
 
-// The destination screen: dropdown, create-directory row, destination stats,
+// The destination screen: one drill-down picker (telescope select + cascading
+// subdirectory dropdowns), an inline create-folder row, destination stats,
 // and the confirm button. Reached only by pressing Move / Copy / Symlink.
 async function openDestScreen(o) {
   pendingOp = o;
   const n = markedFiles().length;
   $("dsttitle").textContent = OP_LABEL[o] + " " + n + " file" + (n === 1 ? "" : "s") + " to\u2026";
   $("dstresult").textContent = "";
-  $("newrow").style.display = "none";
+  if (!$("newname").dataset.touched) $("newname").value = DIR.split("/").filter(Boolean).pop();
+  $("newmsg").style.display = "none";
+  // Full list of what is about to be affected, below all the controls.
+  const sel = markedFiles();
+  // The source tidy-up can only succeed when the move drains the directory.
+  $("rmsrcrow").style.display =
+    o === "move" && sel.length && sel.length === frames.length ? "" : "none";
+  let fh = "<p><b>" + sel.length + " marked file" + (sel.length === 1 ? "" : "s") + ":</b></p><ul>";
+  for (const f of sel) fh += "<li>" + f.name + "</li>";
+  fh += "</ul>";
+  $("filelist").innerHTML = fh;
   disarmConfirm();
   $("dstscreen").classList.add("show");
   await onDest();
 }
 
+// The chosen destination: telescope path + drilled segments.
+function currentPath() {
+  const p = TELPATH[$("tel").value] || "";
+  if (!p) return "";
+  return DRILL.length ? p + "/" + DRILL.join("/") : p;
+}
+
 async function onDest() {
-  dest = $("dest").value;
+  dest = currentPath();
   if (dest) localStorage.setItem("reviewdst:" + DIR, dest);
   destFiles = new Set();
   destInfo = null;
@@ -970,57 +1047,6 @@ async function onDest() {
   renderDstInfo();
 }
 
-// Type an arbitrary path: the server validates it against the review roots
-// and reports whether it exists. Unknown-but-inside paths become selectable
-// options so the info panel and the create flow can act on them.
-async function gotoPath() {
-  const p = $("dstpath").value.trim();
-  if (!p) return;
-  let info;
-  try {
-    const r = await fetch("/review/destinfo?dir=" + encodeURIComponent(p));
-    if (!r.ok) {
-      $("dstinfo").innerHTML = "<p class=col>" + (await r.text()) + "</p>";
-      return;
-    }
-    info = await r.json();
-  } catch (e) {
-    $("dstinfo").innerHTML = "<p class=col>lookup failed: " + e + "</p>";
-    return;
-  }
-  const sel = $("dest");
-  if (!Array.from(sel.options).some((x) => x.value === info.path)) {
-    const o = document.createElement("option");
-    o.value = info.path; o.textContent = info.path;
-    sel.insertBefore(o, sel.options[0] || null);
-  }
-  sel.value = info.path;
-  await onDest();
-}
-
-// Create the currently-chosen path (which destinfo reported as missing).
-async function mkdirDest() {
-  if (!dest) return;
-  let r;
-  try {
-    r = await fetch("/review/mkdir", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ dir: dest }),
-    });
-  } catch (e) { r = null; }
-  if (!r || !r.ok) {
-    const msg = r ? await r.text() : "request failed";
-    $("dstinfo").insertAdjacentHTML("beforeend", "<p class=col>" + msg + "</p>");
-    return;
-  }
-  const d = await r.json();
-  await loadDests();
-  const sel = $("dest");
-  if (Array.from(sel.options).some((x) => x.value === d.path)) sel.value = d.path;
-  await onDest();
-}
-
 // Basic destination facts, recomputed whenever the selection or the marks
 // change: how many files are already there, and how many of the marked files
 // would collide by name.
@@ -1029,13 +1055,6 @@ function renderDstInfo() {
   const btn = $("btnConfirm");
   if (!dest) {
     $("dstinfo").innerHTML = "<p class=col>Choose a destination directory.</p>";
-    btn.disabled = true;
-    return;
-  }
-  if (destInfo && !destInfo.exists) {
-    $("dstinfo").innerHTML = "<p class=col><b>" + dest + "</b> does not exist yet.</p>"
-      + "<button id=\"btnMk\" title=\"Create this directory inside the review root\">Create directory</button>";
-    $("btnMk").addEventListener("click", mkdirDest);
     btn.disabled = true;
     return;
   }
@@ -1074,7 +1093,9 @@ async function confirmApply() {
     return;
   }
   btn.disabled = true;
-  const body = { dir: DIR, op: pendingOp, dst: dest, files: sel.map((f) => f.path) };
+  const body = { dir: DIR, op: pendingOp, dst: dest, files: sel.map((f) => f.path),
+    remove_src_dir: pendingOp === "move" && $("rmsrc").checked };
+  const stopProg = startProgress($("dstresult"));
   let rep;
   try {
     const r = await fetch("/review/apply", {
@@ -1082,13 +1103,18 @@ async function confirmApply() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    rep = await r.json();
-    if (typeof rep !== "object") rep = { moved: 0, copied: 0, linked: 0, deleted: 0, errors: [String(rep)] };
+    const txt = await r.text();
+    try {
+      rep = JSON.parse(txt);
+      if (typeof rep !== "object") rep = { moved: 0, copied: 0, linked: 0, deleted: 0, errors: [String(rep)] };
+    } catch { rep = { moved: 0, copied: 0, linked: 0, deleted: 0, errors: [txt || ("HTTP " + r.status)] }; }
   } catch (e) {
+    stopProg();
     $("dstresult").textContent = "Apply failed: " + e;
     btn.disabled = false;
     return;
   }
+  stopProg();
   for (const f of sel) delete marks[f.path];
   saveMarks();
   let h = "<p>Moved " + rep.moved + ", copied " + rep.copied + ", symlinked "
@@ -1099,56 +1125,174 @@ async function confirmApply() {
     h += "</ul>";
   }
   $("dstresult").innerHTML = h;
+  // A completed move from staging: arm the two-second return **before** the
+  // best-effort refresh below, so a refresh hiccup cannot cancel it.
+  if (IS_STAGING && pendingOp === "move" && rep.moved && !(rep.errors && rep.errors.length))
+    backToStaging($("dstresult"));
   // Re-fetch the now-drained directory and the refreshed destination stats.
-  const m = await (await fetch("/review/manifest?dir=" + encodeURIComponent(DIR))).json();
-  manifest = m; flat(); show();
-  await onDest();
+  try {
+    const m = await (await fetch("/review/manifest?dir=" + encodeURIComponent(DIR))).json();
+    manifest = m; flat(); show();
+    await onDest();
+  } catch {}
   disarmConfirm();
   btn.disabled = false;
+}
+
+// Paint a countdown hint under an apply result and, after two seconds, leave
+// the review page for the staging index. The cache-busting query guarantees a
+// fresh listing (a source directory may have been removed by the tidy-up).
+// Draw a determinate progress bar in `el` fed by /review/progress while an
+// apply POST is in flight. Returns the stop function; call it when the POST
+// lands. The server counts files, not bytes, so the bar is approximate for
+// mixed-size moves — good enough to show the job is alive and how far along.
+function startProgress(el) {
+  el.innerHTML = '<div class="prog"><div class="probar"></div></div>'
+    + '<p class="progtxt">working\u2026</p>';
+  const bar = el.querySelector(".probar");
+  const txt = el.querySelector(".progtxt");
+  const timer = setInterval(async () => {
+    try {
+      const p = await (await fetch("/review/progress")).json();
+      if (p && p.total) {
+        bar.style.width = Math.round(100 * p.done / p.total) + "%";
+        txt.textContent = p.done + " / " + p.total + " files";
+      }
+    } catch {}
+  }, 400);
+  return () => clearInterval(timer);
+}
+
+function backToStaging(el) {
+  el.insertAdjacentHTML("beforeend",
+    "<p style=\"color:#888\">Returning to staging\\u2026</p>");
+  setTimeout(() => location.replace("/staging?t=" + Date.now()), 2000);
 }
 
 async function loadDests() {
   const r = await fetch("/review/destinations");
   if (!r.ok) return;
   const ds = await r.json();
-  const sel = $("dest");
-  const keep = sel.value;
-  sel.innerHTML = "";
-  for (const d of ds) { const o = document.createElement("option"); o.value = d.path; o.textContent = d.label; sel.appendChild(o); }
   // Telescope choices are the telescopes already in the list (`CCD/tel`,
   // `CCD/tel/obj` labels, so the telescope is segment 1): creating a whole
   // new telescope is a separate decision and stays on the index form.
-  const ts = $("newtel");
+  const ts = $("tel");
   ts.innerHTML = "";
-  for (const t of [...new Set(ds.map((d) => d.label.split("/")[1]))].sort()) {
+  // Absolute path of each telescope (label `root/tel`), the anchor for the
+  // drill-down dropdowns.
+  TELPATH = {};
+  for (const d of ds) {
+    const parts = d.label.split("/");
+    if (parts.length === 2) TELPATH[parts[1]] = d.path;
+  }
+  SUBDIRS.clear();
+  // Telescope options: the server-narrowed list for staging moves, else every
+  // telescope already in the destination list.
+  const telNames = TEL_ONLY && TEL_ONLY.length ? TEL_ONLY : Object.keys(TELPATH);
+  for (const t of [...telNames].sort()) {
+    if (!(t in TELPATH)) continue;
     const x = document.createElement("option"); x.value = t; x.textContent = t; ts.appendChild(x);
   }
-  // Fuzzy default: the reviewed directory's basename against every candidate.
+  // Default: the remembered destination (last used for this directory), else
+  // the server-suggested telescope, else a fuzzy match of the reviewed
+  // directory's basename, else — for staging moves — the first telescope.
   const base = DIR.split("/").filter(Boolean).pop().toLowerCase();
-  let guess = ds.find((d) => d.name.toLowerCase() === base)
-           || ds.find((d) => d.name.toLowerCase().includes(base) || base.includes(d.name.toLowerCase()));
-  const saved = localStorage.getItem("reviewdst:" + DIR);
-  const pick = ds.find((d) => d.path === saved) || ds.find((d) => d.path === keep) || guess;
-  if (pick) sel.value = pick.path;
+  const guess = ds.find((d) => d.name.toLowerCase() === base)
+             || ds.find((d) => d.name.toLowerCase().includes(base) || base.includes(d.name.toLowerCase()));
+  const firstTel = ts.options.length ? TELPATH[ts.options[0].value] : "";
+  // The config telescope mapping wins over the remembered destination, unless
+  // the remembered one already lies inside the mapped telescope — then its
+  // deeper (object-level) path is kept.
+  const sug = SUGGEST_TEL && TELPATH[SUGGEST_TEL] ? TELPATH[SUGGEST_TEL] : "";
+  const mem = localStorage.getItem("reviewdst:" + DIR) || "";
+  const def = (sug && (mem === sug || mem.startsWith(sug + "/"))) ? mem
+            : sug || mem || (guess && guess.path) || (IS_STAGING ? firstTel : "");
+  setDrillFromPath(def);
+  if (!$("tel").value && ts.options.length) $("tel").value = ts.options[0].value;
+  await renderDrill();
   await onDest();
 }
 
-function showNewRow() {
-  if (!$("newname").dataset.touched) $("newname").value = DIR.split("/").filter(Boolean).pop();
-  $("newmsg").style.display = "none";
-  $("newrow").style.display = "";
-  $("newname").focus();
-  $("newname").select();
+// Drill-down destination picker: each select lists the existing
+// subdirectories of the level above (from /review/subdirs), so the hierarchy
+// can be walked to any depth without typing a path. DRILL holds the chosen
+// segments below the telescope; the destination is wherever the chain points,
+// and the name input creates a new folder inside the deepest chosen level.
+const DRILL = [];
+const SUBDIRS = new Map();
+let TELPATH = {};
+
+async function subdirs(path) {
+  if (SUBDIRS.has(path)) return SUBDIRS.get(path);
+  let list = [];
+  try {
+    const r = await fetch("/review/subdirs?dir=" + encodeURIComponent(path));
+    if (r.ok) list = await r.json();
+  } catch (e) { /* no drill options rather than an error toast */ }
+  SUBDIRS.set(path, list);
+  return list;
 }
 
-function hideNewRow() {
-  $("newrow").style.display = "none";
+async function renderDrill() {
+  const box = $("drill");
+  box.innerHTML = "";
+  let path = TELPATH[$("tel").value] || "";
+  for (let level = 0; level <= DRILL.length && path; level++) {
+    const subs = await subdirs(path);
+    if (!subs.length) break;
+    const sel = document.createElement("select");
+    sel.title = "Drill into an existing subdirectory, or leave it on \u201Chere\u201D";
+    const stay = document.createElement("option");
+    stay.value = "";
+    stay.textContent = "\u2014 here \u2014";
+    sel.appendChild(stay);
+    for (const s of subs) { const o = document.createElement("option"); o.value = s; o.textContent = s; sel.appendChild(o); }
+    sel.value = level < DRILL.length ? DRILL[level] : "";
+    sel.addEventListener("change", () => {
+      DRILL.length = level;
+      if (sel.value) DRILL.push(sel.value);
+      renderDrill();
+      onDest();
+    });
+    box.appendChild(sel);
+    box.appendChild(document.createTextNode(" "));
+    path = level < DRILL.length ? path + "/" + DRILL[level] : "";
+  }
+}
+
+// Point the picker at an absolute path: find the telescope containing it and
+// replay the remaining segments as drill selections.
+function setDrillFromPath(p) {
+  DRILL.length = 0;
+  if (!p) return;
+  for (const t of Object.keys(TELPATH)) {
+    const base = TELPATH[t];
+    if (p === base) { $("tel").value = t; return; }
+    if (p.startsWith(base + "/")) {
+      $("tel").value = t;
+      DRILL.push(...p.slice(base.length + 1).split("/"));
+      return;
+    }
+  }
+}
+
+// `/` is the nesting separator; everything else non-alphanumeric becomes `_`,
+// matching the server-side normalisation in create_object. NFD decomposition
+// turns é into e + a combining mark, which the strip removes; the ligature and
+// slashed-letter replacements have no decomposition form.
+function foldAcc(s) {
+  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/Æ/g, "AE").replace(/æ/g, "ae").replace(/ß/g, "ss").replace(/ẞ/g, "SS").replace(/Ð/g, "D").replace(/ð/g, "d").replace(/Đ/g, "D").replace(/đ/g, "d").replace(/Ď/g, "D").replace(/ď/g, "d").replace(/Ø/g, "O").replace(/ø/g, "o").replace(/Ř/g, "R").replace(/ř/g, "r").replace(/Ł/g, "L").replace(/ł/g, "l");
+}
+
+function normName(s) {
+  return foldAcc(s).split("/").map(seg => seg.replace(/[^A-Za-z0-9]/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "")).join("/");
 }
 
 async function createDest() {
-  const tel = $("newtel").value, name = $("newname").value.trim();
+  const tel = $("tel").value, leaf = normName($("newname").value.trim());
+  const name = [...DRILL, leaf].filter(Boolean).join("/");
   const msg = $("newmsg");
-  if (!tel || !name) { msg.textContent = "Choose a telescope and enter a name."; msg.style.display = ""; return; }
+  if (!tel || !leaf) { msg.textContent = "Choose a telescope and enter a name."; msg.style.display = ""; return; }
   const btn = $("btnNew");
   btn.disabled = true;
   try {
@@ -1164,11 +1308,11 @@ async function createDest() {
       return;
     }
     const j = await r.json();
-    hideNewRow();
     $("newname").dataset.touched = "";
+    $("newmsg").style.display = "none";
     await loadDests();
-    const sel = $("dest");
-    if (Array.from(sel.options).some((x) => x.value === j.path)) sel.value = j.path;
+    setDrillFromPath(j.path);
+    await renderDrill();
     await onDest();
   } catch (e) {
     msg.textContent = "create failed: " + e;
@@ -1219,17 +1363,12 @@ for (const b of Array.from(document.querySelectorAll("#ops .opbtn"))) {
     }
   });
 }
-$("dest").addEventListener("change", (e) => { onDest(); e.target.blur(); });
-$("btnGo").addEventListener("click", gotoPath);
-$("dstpath").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); gotoPath(); }
-});
-$("btnNewOpen").addEventListener("click", showNewRow);
+$("tel").addEventListener("change", () => { DRILL.length = 0; renderDrill(); onDest(); });
 $("btnNew").addEventListener("click", createDest);
-$("btnNewCancel").addEventListener("click", hideNewRow);
 $("btnConfirm").addEventListener("click", confirmApply);
 $("btnDstBack").addEventListener("click", () => $("dstscreen").classList.remove("show"));
 $("newname").addEventListener("input", () => { $("newname").dataset.touched = "1"; });
+$("newname").addEventListener("blur", () => { $("newname").value = normName($("newname").value.trim()); });
 $("newname").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); createDest(); }
 });
@@ -1269,8 +1408,21 @@ $("btnApply").addEventListener("click", applyAll);
 </body>
 </html>"####;
     html.replace("__CSS__", CSS)
+        .replace("__NAVBAR__", &render_navbar("staging"))
         .replace("__DIR__", &html_escape(dir))
         .replace("__REPEAT__", &nav_repeat_ms.to_string())
+        .replace(
+            "__TELONLY__",
+            &match tel_only {
+                Some(t) if !t.is_empty() => serde_json::to_string(t).unwrap_or_else(|_| "null".into()),
+                _ => "null".into(),
+            },
+        )
+        .replace(
+            "__SUGGEST__",
+            &serde_json::to_string(&suggest_tel).unwrap_or_else(|_| "null".into()),
+        )
+        .replace("__STAGING__", if staging { "true" } else { "false" })
 }
 
 #[cfg(test)]
@@ -1352,12 +1504,106 @@ mod tests {
     }
 
     /// The autorepeat throttle is config-driven, so it must reach the page.
+    /// Every page carries the same global section bar, with the current
+    /// section shown as bold text rather than a link.
+    #[test]
+    fn global_navbar_appears_on_every_page() {
+        let index = render_index_page("/root", "0.00, 0.00", 1, "now", "", "", "?x", "", "", "");
+        let edit = render_edit_page("scope", "M31", "/p", "plan", "");
+        let staging = render_review_index(&[std::path::PathBuf::from("/nowhere")], &[]);
+        let review = render_review("/nowhere", 500, None, None, false);
+        for (name, html) in [
+            ("index", &index),
+            ("edit", &edit),
+            ("staging", &staging),
+            ("review", &review),
+        ] {
+            assert!(html.contains("<nav class=\"topnav\">"), "{name} missing navbar");
+            assert!(html.contains("Staging</a>") || html.contains("Staging</span>"),
+                "{name} missing Staging entry");
+            assert!(
+                html.contains("href=\"/compendium\"") || html.contains("cur\">Compendium<"),
+                "{name} missing Compendium entry"
+            );
+            assert!(!html.contains("__NAVBAR__"), "{name} navbar placeholder left");
+        }
+        // The active section is emphasised, not linked.
+        assert!(index.contains("<span class=\"cur\">Inventory</span>"));
+        assert!(staging.contains("<span class=\"cur\">Staging</span>"));
+        assert!(review.contains("<span class=\"cur\">Staging</span>"));
+        // The old inline links on the index meta line are gone.
+        assert!(
+            !index.contains("Refresh scan</a> &middot;"),
+            "index meta line still carries inline section links"
+        );
+    }
+
     #[test]
     fn review_page_carries_the_configured_autorepeat_throttle() {
-        let html = render_review("/data/Astro/CCD/81GT/M42", 500);
+        let html = render_review("/data/Astro/CCD/81GT/M42", 500, None, None, false);
         assert!(html.contains("data-repeat=\"500\""), "throttle not injected");
         assert!(html.contains("REPEAT_MS"), "throttle not used by the key handler");
         assert!(!html.contains("__REPEAT__"), "placeholder left unsubstituted");
+    }
+
+    /// The staging move flow must scope the telescope dropdown to real
+    /// telescope dirs, preselect the source telescope, offer the source-dir
+    /// tidy-up checkbox, list every marked file, and send the checkbox state.
+    #[test]
+    fn review_page_carries_staging_move_controls_and_hints() {
+        let html = render_review(
+            "/ssd/sync/102CF/M8",
+            500,
+            Some(&["102CF".to_string(), "81GT".to_string()]),
+            Some("102CF"),
+            true,
+        );
+        assert!(html.contains("const TEL_ONLY = [\"102CF\",\"81GT\"];"), "telescope scope missing");
+        assert!(html.contains("const SUGGEST_TEL = \"102CF\";"), "telescope preselect missing");
+        assert!(html.contains("const IS_STAGING = true;"), "staging flag missing");
+        assert!(html.contains("id=\"rmsrc\""), "remove-source-dir checkbox missing");
+        assert!(
+            html.contains("id=\"rmsrcdel\""),
+            "delete-directory checkbox missing from the delete overlay"
+        );
+        assert!(
+            html.contains("remove_src_dir: $(\"rmsrcdel\").checked"),
+            "delete apply must send the checkbox state"
+        );
+        // The checkbox only appears when the delete drains the directory.
+        assert!(
+            html.contains("o === \"delete\" && sel.length && sel.length === frames.length ? \"\" : \"none\";"),
+            "delete-directory checkbox must hide when images would remain"
+        );
+        assert!(html.contains("remove source directory once move is complete"), "checkbox label missing");
+        // The move checkbox only appears when the move drains the directory.
+        assert!(
+            html.contains("o === \"move\" && sel.length && sel.length === frames.length ? \"\" : \"none\";"),
+            "remove-source-dir checkbox must hide when files would remain"
+        );
+        assert!(html.contains("id=\"filelist\""), "marked-file list missing");
+        assert!(html.contains("remove_src_dir:"), "apply must send the checkbox state");
+        assert!(html.contains("const telNames = TEL_ONLY && TEL_ONLY.length ? TEL_ONLY : Object.keys(TELPATH);"), "telescope option construction missing");
+        // The mapping outranks the remembered destination unless the memory
+        // already lies inside the mapped telescope.
+        assert!(
+            html.contains("const def = (sug && (mem === sug || mem.startsWith(sug + \"/\"))) ? mem"),
+            "destination preselect must prefer the mapped telescope"
+        );
+        // A completed move/delete from staging returns to a fresh staging index
+        // after a two-second read of the result; errors keep the user in place.
+        assert!(html.contains("setTimeout(() => location.replace(\"/staging?t=\" + Date.now()), 2000);"));
+        assert!(html.contains("if (IS_STAGING && rep.deleted && !(rep.errors && rep.errors.length)) backToStaging"));
+        assert!(html.contains("if (IS_STAGING && pendingOp === \"move\" && rep.moved && !(rep.errors && rep.errors.length))"));
+        // The file list sits after every control in the destination screen.
+        let at = |s: &str| html.find(s).unwrap_or(usize::MAX);
+        assert!(at("id=\"filelist\"") > at("id=\"btnDstBack\""), "file list must follow the controls");
+        // Ordinary review directories get no hints: null disables both.
+        let plain = render_review("/data/Astro/CCD/81GT/M42", 500, None, None, false);
+        assert!(plain.contains("const TEL_ONLY = null;"), "no scope expected outside staging");
+        assert!(plain.contains("const SUGGEST_TEL = null;"), "no preselect expected outside staging");
+        assert!(plain.contains("const IS_STAGING = false;"), "staging flag must be false outside staging");
+        assert!(!html.contains("__STAGING__") && !plain.contains("__STAGING__"), "placeholder left unsubstituted");
     }
 
     /// The screen is generic: all four operations and every mark gesture must
@@ -1366,7 +1612,7 @@ mod tests {
     /// confirm button; the bar itself must not carry a destination dropdown.
     #[test]
     fn review_page_binds_the_mark_keys_and_all_four_operations() {
-        let html = render_review("/ssd/sync/Pier/Jacoby1", 500);
+        let html = render_review("/ssd/sync/Pier/Jacoby1", 500, None, None, false);
         for fn_name in ["toggleMark", "markAll", "unmarkAll", "invertMarks", "setOp"] {
             assert!(html.contains(fn_name), "{fn_name} missing");
         }
@@ -1396,25 +1642,42 @@ mod tests {
             );
         }
         assert!(html.contains("id=\"dstscreen\""), "destination screen missing");
-        assert!(html.contains("id=\"dest\""), "destination dropdown missing");
+        assert!(html.contains("id=\"tel\""), "telescope dropdown missing");
         assert!(html.contains("id=\"dstinfo\""), "destination info panel missing");
         assert!(html.contains("id=\"btnConfirm\""), "confirm button missing");
         assert!(
-            html.contains("id=\"newtel\"") && html.contains("id=\"btnNew\"") && html.contains("id=\"btnNewOpen\""),
+            html.contains("id=\"tel\"") && html.contains("id=\"btnNew\""),
             "create-directory controls missing"
         );
+        // One picker only: the destination is chosen by drilling dropdowns
+        // (telescope select + cascading #drill chain fed by /review/subdirs),
+        // and the create call posts the slash-joined drill path as the name.
+        assert!(
+            html.contains("id=\"drill\"") && html.contains("/review/subdirs") && html.contains("renderDrill"),
+            "drill-down dropdowns missing"
+        );
+        assert!(
+            html.contains("[...DRILL, leaf].filter(Boolean).join(\"/\")"),
+            "create must send the drilled path"
+        );
+        for gone in ["id=\"dest\"", "id=\"dstpath\"", "id=\"btnGo\"", "id=\"newtel\"", "id=\"btnNewOpen\""] {
+            assert!(!html.contains(gone), "second destination picker remains: {gone}");
+        }
         assert!(html.contains("Existing files"), "destination file count missing");
         assert!(html.contains("Duplicate file names"), "duplicate-name report missing");
-        assert!(html.contains("id=\"dstpath\"") && html.contains("id=\"btnGo\""),
-            "arbitrary-path destination box missing");
         assert!(html.contains("/review/destinfo"), "destinfo endpoint missing");
-        assert!(html.contains("/review/mkdir"), "mkdir endpoint missing");
-        assert!(html.contains("does not exist yet") && html.contains("btnMk"),
-            "create-missing-directory flow missing");
         assert!(!html.contains("to <select"), "the bar must not carry a destination dropdown");
         assert!(html.contains("Confirm") && html.contains("OP_LABEL") && html.contains("sel.length"),
             "confirmation must state the operation and the quantity");
         assert!(html.contains("/review/apply"), "apply endpoint missing");
+        // Progress bar: client polls /review/progress while an apply is open.
+        assert!(html.contains("function startProgress(el)"), "progress bar helper missing");
+        assert!(html.contains("fetch(\"/review/progress\")"), "progress polling missing");
+        assert!(html.contains("const stopProg = startProgress($(\"dstresult\"));"),
+            "move/copy apply must show progress");
+        assert!(html.contains("const stopProg = startProgress($(\"result\"));"),
+            "delete apply must show progress");
+        assert!(html.contains(".probar { height: 100%;"), "progress bar CSS missing");
         assert!(html.contains("data-dir=\"/ssd/sync/Pier/Jacoby1\""), "dir not injected");
     }
 
@@ -1423,7 +1686,7 @@ mod tests {
     /// DSLR gray, and the frame must be applied when the current frame changes.
     #[test]
     fn review_page_frames_the_image_in_the_filter_colour() {
-        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        let html = render_review("/ssd/sync/Pier/SAI3", 500, None, None, false);
         for (needle, label) in [
             ("\"SII\": \"#A020F0\"", "SII purple"),
             ("\"Ha\": \"#FF3030\"", "Ha red"),
@@ -1449,14 +1712,15 @@ mod tests {
     /// not even for the selected operation — `active` is an unstyled JS hook.
     #[test]
     fn review_page_gives_every_button_one_uniform_style() {
-        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        let html = render_review("/ssd/sync/Pier/SAI3", 500, None, None, false);
         assert!(
             html.contains("button { padding: 6px 14px; background: #333;"),
             "the single base button style must set the shared background"
         );
         // No per-class button restyling survives in the review page's own
         // CSS (the shared theme's `button.danger` rule stays for the index
-        // page, but the review screen must never use that class).
+        // page, but the review screen must never use that class). The one
+        // allowed exception is the red Delete button, asserted below.
         for banned in [
             "button.plain { background",
             ".opbtn { background",
@@ -1465,6 +1729,14 @@ mod tests {
         ] {
             assert!(!html.contains(banned), "per-class button styling remains: {banned}");
         }
+        assert!(
+            html.contains("#btnApply, #btnConfirm { background: #8b2635; }"),
+            "the destructive Apply/Confirm buttons must read red"
+        );
+        assert!(
+            !html.contains(".opbtn[data-op=\"delete\"]"),
+            "the Delete operation button must stay uniform #333"
+        );
         assert!(!html.contains("opbtn danger"), "Delete must not carry a danger style");
         assert!(!html.contains("class=\"danger\""), "no button may use the danger class");
         assert!(!html.contains("className = \"danger\""), "no JS may set the danger class");
@@ -1474,7 +1746,7 @@ mod tests {
     /// mark-and-advance, and a toggle that must NOT advance the slideshow.
     #[test]
     fn review_page_has_a_mouse_navigation_bar() {
-        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        let html = render_review("/ssd/sync/Pier/SAI3", 500, None, None, false);
         assert!(html.contains("id=\"nav\""), "bottom navigation bar missing");
         for id in ["btnPrev", "btnNext", "btnMarkNext", "btnToggle"] {
             assert!(html.contains(&format!("id=\"{id}\"")), "{id} missing");
@@ -1533,7 +1805,7 @@ mod tests {
     /// "Create directory" button.
     #[test]
     fn review_page_explains_every_control_on_hover() {
-        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        let html = render_review("/ssd/sync/Pier/SAI3", 500, None, None, false);
         for tag in ["<button", "<select", "<input"] {
             for (n, chunk) in html.match_indices(tag) {
                 let _ = n;
@@ -1547,10 +1819,6 @@ mod tests {
                 );
             }
         }
-        assert!(
-            html.contains("id=\\\"btnMk\\\" title="),
-            "the dynamically created 'Create directory' button must also explain itself"
-        );
     }
 
     /// Sorting is star-aware by default: the dropdown leads with the star
@@ -1559,7 +1827,7 @@ mod tests {
     /// faintest-first.
     #[test]
     fn review_page_sorts_by_stars_by_default() {
-        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        let html = render_review("/ssd/sync/Pier/SAI3", 500, None, None, false);
         assert!(html.contains("value=\"star\""), "star sort option missing");
         assert!(html.contains("value=\"med\""), "median sort option missing");
         for gone in ["value=\"frac\"", "value=\"sig\"", "value=\"q\""] {
@@ -1584,7 +1852,7 @@ mod tests {
     /// line live on the file-name line.
     #[test]
     fn review_page_badge_counts_marks_and_meta_shows_frame_status() {
-        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        let html = render_review("/ssd/sync/Pier/SAI3", 500, None, None, false);
         assert!(
             html.contains("justify-content: center; flex-wrap: wrap; z-index: 5;"),
             "the top bar must be centered like the bottom bar"
@@ -1613,9 +1881,37 @@ mod tests {
 
     /// Marked files wear a yellow ring around the filter-colour frame. It is
     /// driven from `setBadge`, so every mark change repaints it.
+    /// Applying must survive an empty selection and a non-JSON error body:
+    /// a stale armed button once POSTed zero files and surfaced the server's
+    /// plain-text "nothing to do" as a raw SyntaxError.
+    #[test]
+    fn review_page_apply_survives_empty_selection_and_text_errors() {
+        let html = render_review("/ssd/sync/Pier/SAI3", 500, None, None, false);
+        assert!(
+            html.contains("if (!sel.length) { renderSummary(); return; }"),
+            "apply must refuse an empty selection"
+        );
+        // Both apply paths read the body as text and fall back to showing it.
+        assert_eq!(
+            html.matches("const txt = await r.text();").count(),
+            2,
+            "both apply paths must parse responses text-safely"
+        );
+        assert!(
+            html.contains("errors: [txt ||"),
+            "non-JSON bodies must surface as ordinary errors"
+        );
+        // After a successful apply the summary is restated, which disarms
+        // and disables the button when nothing is left marked.
+        assert!(
+            html.contains("renderSummary();\n  "),
+            "apply must restate the summary after success"
+        );
+    }
+
     #[test]
     fn review_page_frames_marked_files_with_a_yellow_outer_border() {
-        let html = render_review("/ssd/sync/Pier/SAI3", 500);
+        let html = render_review("/ssd/sync/Pier/SAI3", 500, None, None, false);
         assert!(
             html.contains("$(\"img\").style.outline = m ? \"3px solid #FFD700\" : \"none\";"),
             "marked files must get a yellow ring around the filter border"

@@ -470,24 +470,6 @@ pub fn guard_new_dir(roots: &[PathBuf], raw: &str) -> Result<PathBuf, String> {
     Err(last)
 }
 
-/// Create a new destination directory inside a review root. The path is
-/// checked lexically first (it does not exist yet, so it cannot be
-/// canonicalised), then **re-checked after creation**: a symlinked component
-/// along the way could otherwise land the new directory outside the root.
-pub fn create_dest_dir(roots: &[PathBuf], raw: &str) -> Result<PathBuf, String> {
-    let cand = guard_new_dir(roots, raw)?;
-    fs::create_dir_all(&cand).map_err(|e| format!("create {}: {e}", cand.display()))?;
-    let real = fs::canonicalize(&cand).map_err(|e| format!("resolve {}: {e}", cand.display()))?;
-    let inside = roots
-        .iter()
-        .filter_map(|r| fs::canonicalize(r).ok())
-        .any(|rr| real.starts_with(&rr));
-    if !inside {
-        return Err(format!("created path escapes the review roots: {raw}"));
-    }
-    Ok(real)
-}
-
 // --- Apply ------------------------------------------------------------------
 
 /// What to do with the marked set.
@@ -534,6 +516,20 @@ fn target_for(src: &Path, dst_dir: &Path) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// Best-effort copy of the source's access + modification times onto the
+/// target. `fs::copy` attempts this itself but silently ignores failures;
+/// setting them explicitly makes the intent visible. Creation/birth time
+/// cannot be set on Linux, so it is not preserved across devices.
+fn preserve_times(src: &Path, target: &Path) {
+    if let Ok(md) = fs::metadata(src) {
+        let _ = filetime::set_file_times(
+            target,
+            filetime::FileTime::from_last_access_time(&md),
+            filetime::FileTime::from_last_modification_time(&md),
+        );
+    }
+}
+
 /// Move `src` onto `dst_dir/<basename>`, refusing to clobber.
 ///
 /// Move is the staging case: a Syncthing transfer area only drains if the
@@ -549,6 +545,7 @@ fn move_into(src: &Path, dst_dir: &Path) -> Result<(), String> {
             File::open(&target)
                 .and_then(|f| f.sync_all())
                 .map_err(|e| format!("fsync: {e}"))?;
+            preserve_times(src, &target);
             fs::remove_file(src).map_err(|e| format!("remove source: {e}"))?;
             Ok(())
         }
@@ -562,6 +559,7 @@ fn copy_into(src: &Path, dst_dir: &Path) -> Result<(), String> {
     File::open(&target)
         .and_then(|f| f.sync_all())
         .map_err(|e| format!("fsync: {e}"))?;
+    preserve_times(src, &target);
     Ok(())
 }
 
@@ -588,6 +586,7 @@ pub fn apply(
     op: Op,
     dst_raw: Option<&str>,
     files: &[String],
+    progress: Option<&std::sync::atomic::AtomicUsize>,
 ) -> ApplyReport {
     let mut rep = ApplyReport::default();
 
@@ -615,6 +614,11 @@ pub fn apply(
     };
 
     for raw in files {
+        // Count every attempted file, including ones that fail validation,
+        // so the bar always reaches the total.
+        if let Some(p) = progress {
+            p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let src = match resolve_within(src_dir, raw) {
             Ok(v) => v,
             Err(e) => {
@@ -813,6 +817,25 @@ pub fn list_destinations(roots: &[PathBuf], cap: usize, max_depth: usize) -> Vec
     out
 }
 
+/// Immediate child **directory** names of `raw`, which must exist inside one
+/// of the `roots`. Powers the drill-down dropdowns on the review page: each
+/// select lists these children so the hierarchy can be walked without typing
+/// a path. Dot-directories are skipped, names are sorted, and the list is
+/// capped so a pathological directory cannot bloat the response.
+pub fn list_subdirs(roots: &[PathBuf], raw: &str, cap: usize) -> Result<Vec<String>, String> {
+    let dir = resolve_within_any(roots, raw)?;
+    let entries = fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    out.sort();
+    out.truncate(cap);
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Destination {
     /// `root/telescope/object`, shown in the dropdown.
@@ -964,16 +987,20 @@ mod tests {
     }
 
     #[test]
-    fn create_dest_dir_makes_the_directory_and_rejects_escapes() {
-        let root = fs::canonicalize(tmpdir("mkdir")).unwrap();
-        fs::create_dir_all(root.join("81GT")).unwrap();
-        let d = root.join("81GT/New Obj");
-        let made = create_dest_dir(&roots(&[&root]), d.to_str().unwrap()).unwrap();
-        assert!(made.is_dir(), "the directory must be created");
-        // An escape must be refused **and** left uncreated.
-        let nope = root.join("../nope");
-        assert!(create_dest_dir(&roots(&[&root]), nope.to_str().unwrap()).is_err());
-        assert!(!nope.exists());
+    fn list_subdirs_lists_sorted_child_dirs_only() {
+        let root = fs::canonicalize(tmpdir("subdirs")).unwrap();
+        fs::create_dir_all(root.join("81GT/M42/deep")).unwrap();
+        fs::create_dir_all(root.join("81GT/.hidden")).unwrap();
+        fs::write(root.join("81GT/loose.fits"), b"x").unwrap();
+        let subs = list_subdirs(&roots(&[&root]), root.join("81GT").to_str().unwrap(), 100).unwrap();
+        assert_eq!(subs, vec!["M42".to_string()], "only real dirs, no dot-dirs, no files");
+        let deeper =
+            list_subdirs(&roots(&[&root]), root.join("81GT/M42").to_str().unwrap(), 100).unwrap();
+        assert_eq!(deeper, vec!["deep".to_string()]);
+        // Outside every root: refused.
+        assert!(list_subdirs(&roots(&[&root]), "/tmp", 100).is_err());
+        // A missing path is refused too (drill-down only walks existing dirs).
+        assert!(list_subdirs(&roots(&[&root]), root.join("nope").to_str().unwrap(), 100).is_err());
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1027,7 +1054,7 @@ mod tests {
             Op::Move,
             Some(dest.to_str().unwrap()),
             &[f.to_string_lossy().into_owned()],
-        );
+            None);
         assert_eq!(rep.moved, 1, "{:?}", rep.errors);
         assert_eq!(fs::read(dest.join("a.fits")).unwrap(), b"payload");
         assert!(!f.exists(), "move must remove the source");
@@ -1039,7 +1066,7 @@ mod tests {
             Op::Move,
             Some(dest.to_str().unwrap()),
             &[f.to_string_lossy().into_owned()],
-        );
+            None);
         assert_eq!(rep2.moved, 0);
         assert_eq!(fs::read(dest.join("a.fits")).unwrap(), b"payload", "must not overwrite");
     }
@@ -1061,7 +1088,7 @@ mod tests {
             Some(dest.to_str().unwrap()),
             &[src_dir.join("new.fits").to_string_lossy().into_owned(),
               src_dir.join("dup.fits").to_string_lossy().into_owned()],
-        );
+            None);
         assert_eq!(rep.copied, 1, "{:?}", rep.errors);
         assert!(src_dir.join("new.fits").exists(), "copy must keep the source");
         assert_eq!(fs::read(dest.join("new.fits")).unwrap(), b"new");
@@ -1084,7 +1111,7 @@ mod tests {
             Op::Symlink,
             Some(dest.to_str().unwrap()),
             &[f.to_string_lossy().into_owned()],
-        );
+            None);
         assert_eq!(rep.linked, 1, "{:?}", rep.errors);
         assert!(f.exists(), "symlink must leave the source in place");
 
@@ -1102,7 +1129,7 @@ mod tests {
             Op::Symlink,
             Some(dest.to_str().unwrap()),
             &[src_dir.join("b.fits").to_string_lossy().into_owned()],
-        );
+            None);
         assert_eq!(rep2.linked, 0);
         assert_eq!(fs::read(dest.join("b.fits")).unwrap(), b"old");
     }
@@ -1113,9 +1140,39 @@ mod tests {
         let root = tmpdir("del_root");
         let f = src_dir.join("gone.fits");
         fs::write(&f, b"x").unwrap();
-        let rep = apply(&src_dir, &roots(&[&root]), Op::Delete, None, &[f.to_string_lossy().into_owned()]);
+        let rep = apply(&src_dir, &roots(&[&root]), Op::Delete, None, &[f.to_string_lossy().into_owned()], None);
         assert_eq!(rep.deleted, 1, "{:?}", rep.errors);
         assert!(!f.exists());
+    }
+
+    #[test]
+    fn apply_advances_the_progress_counter_per_file() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tmpdir("prog");
+        let src_dir = root.join("81GT/src");
+        let dest = root.join("81GT/dst");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let names: Vec<String> = ["a.fits", "b.fits", "ghost.fits"]
+            .iter()
+            .map(|n| src_dir.join(n).to_string_lossy().into_owned())
+            .collect();
+        for n in ["a.fits", "b.fits"] {
+            fs::write(src_dir.join(n), b"payload").unwrap();
+        }
+        let done = AtomicUsize::new(0);
+        let rep = apply(
+            &src_dir,
+            &roots(&[&root]),
+            Op::Move,
+            Some(dest.to_str().unwrap()),
+            &names,
+            Some(&done),
+        );
+        assert_eq!(rep.moved, 2);
+        assert_eq!(rep.errors.len(), 1, "the missing file is reported");
+        assert_eq!(done.load(Ordering::Relaxed), 3, "every file attempted counts");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1131,7 +1188,7 @@ mod tests {
             Op::Move,
             Some(missing.to_str().unwrap()),
             &[src_dir.join("a.fits").to_string_lossy().into_owned()],
-        );
+            None);
         assert_eq!(rep.moved, 0);
         assert!(!missing.exists(), "apply must not auto-create destinations");
         assert!(src_dir.join("a.fits").exists(), "source must survive a rejected batch");
@@ -1155,7 +1212,7 @@ mod tests {
             Op::Move,
             Some(root.join("81GT/x").to_str().unwrap()),
             &[outside.to_string_lossy().into_owned()],
-        );
+            None);
         assert_eq!(rep.moved, 0);
         assert!(rep.errors.iter().any(|e| e.contains("escapes")), "{:?}", rep.errors);
         assert!(outside.exists());
@@ -1176,7 +1233,7 @@ mod tests {
             Op::Move,
             Some(escape.to_str().unwrap()),
             &[src_dir.join("a.fits").to_string_lossy().into_owned()],
-        );
+            None);
         assert_eq!(rep.moved, 0, "destination outside the allowed roots must be refused");
         assert!(!escape.join("a.fits").exists());
         fs::remove_dir_all(&escape).ok();

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,6 +38,9 @@ pub struct AppState {
     pub review_roots: Vec<PathBuf>,
     /// Autorepeat throttle for the review screen's arrow keys, in ms.
     pub nav_repeat_ms: u64,
+    /// Staging telescope name -> inventory telescope name (config
+    /// `staging_tel_map`); unmapped names fall back to name equality.
+    pub tel_map: HashMap<String, String>,
     previews: Option<PreviewCache>,
     /// Parsed manifests keyed by canonical reviewed directory.
     manifests: Mutex<HashMap<String, Manifest>>,
@@ -46,6 +50,10 @@ pub struct AppState {
     /// Preview keys that failed to render. A corrupt FITS is not retried every
     /// sweep pass; a changed mtime/size produces a new key and is retried.
     failed_keys: Mutex<HashSet<u64>>,
+    /// In-flight apply job: (total files, per-file counter). The browser polls
+    /// `/review/progress` while the apply POST is still open. Single-user tool,
+    /// so one global slot is enough — a second apply simply replaces it.
+    pub apply_progress: Mutex<Option<(usize, Arc<AtomicUsize>)>>,
     /// Serializes full FITS decodes: each one saturates rayon for ~250 ms.
     render_permits: Semaphore,
 }
@@ -68,6 +76,7 @@ impl AppState {
         cache_dir: PathBuf,
         review_roots: Vec<PathBuf>,
         nav_repeat_ms: u64,
+        tel_map: HashMap<String, String>,
     ) -> Arc<Self> {
         let previews = Some(PreviewCache::new(cache_dir));
         Arc::new(Self {
@@ -84,10 +93,12 @@ impl AppState {
             staging_root,
             review_roots,
             nav_repeat_ms,
+            tel_map,
             previews,
             manifests: Mutex::new(HashMap::new()),
             dests: Mutex::new(None),
             failed_keys: Mutex::new(HashSet::new()),
+            apply_progress: Mutex::new(None),
             render_permits: Semaphore::new(1),
         })
     }
@@ -96,6 +107,54 @@ impl AppState {
     /// review roots. Every review route goes through this first.
     fn review_path(&self, raw: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
         review::resolve_within_any(&self.review_roots, raw).map_err(|e| (StatusCode::BAD_REQUEST, e))
+    }
+
+    /// Resolve a **destination** path. Frames may be reviewed anywhere, but
+    /// move/copy/symlink destinations live only inside the inventory (CCD)
+    /// root — staging is a transit area, never a destination.
+    fn dest_path(&self, raw: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+        review::resolve_within_any(std::slice::from_ref(&self.root), raw)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))
+    }
+
+    /// Move-flow hints for a reviewed directory inside staging:
+    /// (telescope names usable as destinations, telescope of the reviewed
+    /// dir). Telescopes are the child dirs of the staging root — the
+    /// Syncthing per-telescope folders — intersected with directories that
+    /// already exist under the CCD root, so the dropdown can never offer a
+    /// non-telescope directory that happens to sit at the top of CCD. The
+    /// reviewed dir's telescope is its first component under staging. `None`
+    /// for any directory outside staging.
+    fn staging_move_hint(&self, dir: &std::path::Path) -> Option<(Vec<String>, Option<String>)> {
+        let staging = self.staging_root.as_ref()?;
+        let staging = std::fs::canonicalize(staging).ok()?;
+        let rel = dir.strip_prefix(&staging).ok()?;
+        if rel.as_os_str().is_empty() {
+            return None;
+        }
+        let tel = rel.components().next()?.as_os_str().to_string_lossy().to_string();
+        // Staging folders are named after the mount, inventory ones after the
+        // instrument; the config map translates between the two. Unmapped
+        // names pass through unchanged, so name-equal trees behave as before.
+        let mapped = |n: &str| self.tel_map.get(n).cloned().unwrap_or_else(|| n.to_string());
+        let mut tels: Vec<String> = std::fs::read_dir(&staging)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.'))
+            .map(|n| mapped(&n))
+            .filter(|m| self.root.join(m).is_dir())
+            .collect();
+        tels.sort();
+        tels.dedup();
+        let want = mapped(&tel);
+        let suggest = if tels.iter().any(|t| *t == want) {
+            Some(want)
+        } else {
+            None
+        };
+        Some((tels, suggest))
     }
 
     fn cached_dests(&self) -> Option<Vec<review::Destination>> {
@@ -223,10 +282,11 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/review/manifest", get(review_manifest))
         .route("/review/preview", get(review_preview))
         .route("/review/destinations", get(review_destinations))
+        .route("/review/subdirs", get(review_subdirs))
         .route("/review/destinfo", get(review_destinfo))
-        .route("/review/mkdir", post(review_mkdir))
         .route("/review/newdest", post(review_newdest))
         .route("/review/apply", post(review_apply))
+        .route("/review/progress", get(review_progress))
         .with_state(state)
 }
 
@@ -359,11 +419,6 @@ async fn index(
         &header_cells,
         &rows.join("\n"),
         &pager,
-        if state.staging_root.is_some() {
-            " &middot; <a href=\"/review\">Review directories</a> &middot; <a href=\"/staging\">Staging</a>"
-        } else {
-            " &middot; <a href=\"/review\">Review directories</a>"
-        },
     );
 
     Html(html).into_response()
@@ -450,12 +505,119 @@ fn bad_component(s: &str) -> bool {
     s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\\') || s.contains('\0')
 }
 
-/// Create `CCD/<telescope>/<name>` together with its `plan.md`.
+/// Fold a Latin accented, diacritic, or ligature character to its ASCII
+/// spelling, so `Céphée` becomes `Cephee` rather than `C_ph_e`.
 ///
-/// Shared by the index form and `POST /staging/newdest` so a destination made
-/// from the review page is indistinguishable from one made on the index:
-/// `traverse.rs` reads `plan.md` for RA/Dec and for the latest-image fallback,
-/// so a bare directory would behave differently in the inventory.
+/// Characters with no ASCII spelling return `None` and fall through to the `_`
+/// rule, so non-Latin scripts (Cyrillic, Greek, CJK) are unaffected here.
+/// Combining marks (`e` + U+0301) map to `""`: the base letter is already
+/// ASCII, so the mark is simply dropped.
+fn fold_accented(ch: char) -> Option<&'static str> {
+    Some(match ch {
+        'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'Ā' | 'Ă' | 'Ą' => "A",
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
+        'Æ' => "AE",
+        'æ' => "ae",
+        'Ç' | 'Ć' | 'Ĉ' | 'Ċ' => "C",
+        'ç' | 'ć' | 'ĉ' | 'ċ' => "c",
+        'È' | 'É' | 'Ê' | 'Ë' | 'Ĕ' | 'Ě' => "E",
+        'è' | 'é' | 'ê' | 'ë' | 'ĕ' | 'ě' | 'ē' | 'Ė' | 'ę' => "e",
+        'Ĝ' | 'Ğ' | 'Ġ' | 'Ģ' => "G",
+        'ĝ' | 'ğ' | 'ġ' | 'ģ' => "g",
+        'Ĥ' => "H",
+        'ĥ' => "h",
+        'Ì' | 'Í' | 'Î' | 'Ï' | 'Ĩ' | 'Ī' | 'Ĭ' | 'İ' => "I",
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'ı' => "i",
+        'Ķ' => "K",
+        'ķ' => "k",
+        'Ľ' | 'Ĺ' | 'Ļ' | 'Ł' => "L",
+        'ľ' | 'ĺ' | 'ļ' | 'ł' => "l",
+        'Ñ' | 'Ņ' | 'Ň' => "N",
+        'ñ' | 'ņ' | 'ň' | 'ń' => "n",
+        'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' | 'Ō' | 'Ő' => "O",
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => "o",
+        'Ŕ' | 'Ŗ' => "R",
+        'ŕ' | 'ŗ' => "r",
+        'Š' | 'Ŝ' | 'Ş' => "S",
+        'š' | 'ŝ' | 'ş' => "s",
+        'Ť' | 'Ţ' => "T",
+        'ť' | 'ţ' => "t",
+        'Ù' | 'Ú' | 'Û' | 'Ü' | 'Ũ' | 'Ū' | 'Ű' | 'Ų' => "U",
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ű' | 'ų' => "u",
+        'Ý' | 'Ŷ' => "Y",
+        'ý' | 'ŷ' | 'ÿ' => "y",
+        'Ź' | 'Ż' | 'Ž' => "Z",
+        'ź' | 'ż' | 'ž' => "z",
+        'Ð' => "D",
+        'ð' => "d",
+        'Đ' => "D",
+        'đ' => "d",
+        'Ď' => "D",
+        'ď' => "d",
+        'Ř' => "R",
+        'ř' => "r",
+        'Þ' => "TH",
+        'þ' => "th",
+        'ß' => "ss",
+        'ẞ' => "SS",
+        'Ĳ' => "IJ",
+        'ĳ' => "ij",
+        'Œ' => "OE",
+        'œ' => "oe",
+        '\u{0300}'..'\u{036f}' => "",
+        _ => return None,
+    })
+}
+
+/// Normalise a new object name to ASCII alphanumerics only: accented Latin
+/// letters are folded to their ASCII spelling first (`Céphée` → `Cephee`), then
+/// every remaining character that is not `[A-Za-z0-9]` becomes `_`, runs of `_`
+/// collapse to one, and leading and trailing `_` are trimmed per segment.
+///
+/// `/` is kept as the nesting separator, so the review page's drill-down path
+/// (`M42/deep/sub`) still nests, and `NGC 7331 (Marat)` becomes `NGC_7331_Marat`
+/// — the same underscore convention as the Compendium thumbnail stems
+/// (`0001.Abell_01.jpg`).
+///
+/// Unlike `compendium::sanitize_name`, which maps characters 1:1 for thumbnail
+/// stems (`M13 (Rosette)!` → `M13__Rosette__`), this collapses runs and trims
+/// edges so a typed name lands as a tidy directory; the two are deliberately
+/// not shared.
+///
+/// Idempotent: a clean name is a no-op, so the handlers can normalise the name
+/// for their flash messages and labels before `create_object` normalises again
+/// as the authoritative choke point.
+fn sanitize_object_name(s: &str) -> String {
+    s.split('/')
+        .map(|seg| {
+            let mut out = String::with_capacity(seg.len());
+            for ch in seg.chars() {
+                if ch.is_ascii_alphanumeric() {
+                    out.push(ch);
+                } else if let Some(folded) = fold_accented(ch) {
+                    // Every fold is ASCII alphanumerics (or empty for a
+                    // combining mark), so it never introduces a `_`.
+                    out.push_str(folded);
+                } else if !out.ends_with('_') {
+                    out.push('_');
+                }
+            }
+            out.trim_matches('_').to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Create `CCD/<telescope>/<name>`, optionally together with its `plan.md`.
+///
+/// `name` may contain `/` to nest deeper (`M42/sub/deep`); every segment is
+/// sanitised individually and all intermediate directories are created.
+///
+/// The index form passes `with_plan: true` so the object is immediately
+/// visible to `traverse.rs` (RA/Dec + latest-image fallback). The review
+/// page's move flow passes `with_plan: false`: a destination created on the
+/// way to a move is just a landing folder, and an empty `plan.md` there only
+/// creates clutter the user has to edit or delete later.
 ///
 /// Errors are human-readable because both callers surface them verbatim.
 fn create_object(
@@ -463,6 +625,7 @@ fn create_object(
     telescope: &str,
     name: &str,
     meta: &PlanMeta<'_>,
+    with_plan: bool,
 ) -> Result<PathBuf, String> {
     if telescope.is_empty() || name.is_empty() {
         return Err("Please choose a telescope and enter an object name.".to_string());
@@ -472,19 +635,32 @@ fn create_object(
     if bad_component(telescope) {
         return Err(format!("Invalid telescope name: {telescope}"));
     }
-    if bad_component(name) {
+    // Backslashes and NUL bytes are never part of a legitimate name, and
+    // sanitising them away would hide an attempted escape, so they are refused
+    // outright before any rewriting happens.
+    if name.contains('\\') || name.contains('\0') {
+        return Err(format!("Invalid object name: {name}"));
+    }
+    // Slashes are allowed so the review page's drill-down dropdowns can nest
+    // at any depth; every other character is normalised to `_`, so the created
+    // directory and its `plan.md` heading are alphanumerics-only.
+    let name = sanitize_object_name(name);
+    // `/` survives sanitising, so a segment that sanitises to nothing (`..`,
+    // `//`, `!!!/x`) is still a rejected name; `.` and `..` can no longer
+    // survive, so the escape checks above stay meaningful.
+    if name.is_empty() || name.split('/').any(bad_component) {
         return Err(format!("Invalid object name: {name}"));
     }
     if !root.join(telescope).is_dir() {
         return Err(format!("Telescope directory not found: {telescope}"));
     }
     // Belt and braces: prove the joined path stays under the CCD root even
-    // though the components are already sanitised. The candidate must be
-    // absolute — resolve_within canonicalizes the *parent*, and a relative
-    // parent would be resolved against the process CWD, not the root.
+    // though the components are already sanitised. The check is **lexical**
+    // (guard_new_dir): for a nested new name the intermediate directories do
+    // not exist yet, so the path cannot be canonicalised here.
     let root_real = std::fs::canonicalize(root).map_err(|e| format!("CCD root: {e}"))?;
     let obj_dir =
-        review::resolve_within(&root_real, &root_real.join(telescope).join(name).to_string_lossy())?;
+        review::guard_new_dir(&[root_real.clone()], &root_real.join(telescope).join(&name).to_string_lossy())?;
     if obj_dir.exists() {
         return Err(format!(
             "Object directory already exists: {telescope}/{name}"
@@ -519,10 +695,18 @@ fn create_object(
             content.push_str("---\n\n");
         }
         content.push_str(&format!("# {name}\n\n## Plan\n"));
-        std::fs::write(obj_dir.join("plan.md"), content)?;
+        if with_plan {
+            std::fs::write(obj_dir.join("plan.md"), content)?;
+        }
         Ok(())
     })()
     .map_err(|e| format!("Failed to create {}: {e}", obj_dir.display()))?;
+    // Re-check after creation: a symlinked component along a nested path
+    // could otherwise land the new directory outside the root.
+    let real = std::fs::canonicalize(&obj_dir).map_err(|e| format!("resolve {}: {e}", obj_dir.display()))?;
+    if !real.starts_with(&root_real) {
+        return Err(format!("created path escapes the CCD root: {name}"));
+    }
     Ok(obj_dir)
 }
 
@@ -531,7 +715,8 @@ async fn add_object(
     Form(form): Form<AddForm>,
 ) -> Response {
     let telescope = form.telescope.unwrap_or_default().trim().to_string();
-    let name = form.object.unwrap_or_default().trim().to_string();
+    // Normalise here too so the flash message reports the name that is created.
+    let name = sanitize_object_name(form.object.unwrap_or_default().trim());
     let constellation = form.constellation.unwrap_or_default().trim().to_string();
     let ra = form.ra.unwrap_or_default().trim().to_string();
     let dec = form.dec.unwrap_or_default().trim().to_string();
@@ -545,7 +730,7 @@ async fn add_object(
         rotation: &rotation,
         sample: &sample,
     };
-    match create_object(&state.root, &telescope, &name, &meta) {
+    match create_object(&state.root, &telescope, &name, &meta, true) {
         Ok(_) => {
             // Force cache refresh
             state.cache.lock().unwrap().records = None;
@@ -571,11 +756,12 @@ async fn review_newdest(
     Json(req): Json<NewDestRequest>,
 ) -> Result<Json<review::Destination>, (StatusCode, String)> {
     let telescope = req.telescope.trim().to_string();
-    let name = req.name.trim().to_string();
+    // Normalise here too so the returned label matches the directory created.
+    let name = sanitize_object_name(req.name.trim());
     let st = state.clone();
     let (tel, nm) = (telescope.clone(), name.clone());
     let created = tokio::task::spawn_blocking(move || {
-        create_object(&st.root, &tel, &nm, &EMPTY_META)
+        create_object(&st.root, &tel, &nm, &EMPTY_META, false)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -946,6 +1132,10 @@ struct ApplyRequest {
     /// Destination directory. Required for move/copy/symlink, ignored for delete.
     dst: Option<String>,
     files: Vec<String>,
+    /// Remove the source directory once a move completes. Only an empty
+    /// directory is ever removed; leftovers keep it in place.
+    #[serde(default)]
+    remove_src_dir: bool,
 }
 
 /// The staging launcher: directories under the staging root that hold frames.
@@ -984,7 +1174,18 @@ async fn review(
     if !dir.is_dir() {
         return Err((StatusCode::NOT_FOUND, "not a directory".to_string()));
     }
-    Ok(Html(render_review(&dir.to_string_lossy(), state.nav_repeat_ms)))
+    let hint = state.staging_move_hint(&dir);
+    let (tel_only, suggest_tel) = match &hint {
+        Some((tels, suggest)) => (Some(tels.clone()), suggest.clone()),
+        None => (None, None),
+    };
+    Ok(Html(render_review(
+        &dir.to_string_lossy(),
+        state.nav_repeat_ms,
+        tel_only.as_deref(),
+        suggest_tel.as_deref(),
+        hint.is_some(),
+    )))
 }
 
 async fn review_manifest(
@@ -1121,20 +1322,37 @@ async fn review_destinations(
     if let Some(cached) = state.cached_dests() {
         return Ok(Json(cached));
     }
-    // The dropdown offers children of **every** review root, down to
-    // telescope / object level (`root/tel`, `root/tel/obj`): the roots
-    // themselves and deeper subdirs (`master`, `*.pxiproject`, …) are not
-    // offered. Any other directory inside a root can still be typed into the
-    // destination screen and arrives via `/review/destinfo`. A bounded
-    // read_dir walk, deliberately NOT get_records(): that path takes a
-    // std Mutex across a traverse measured at ~48 s, which would stall every
-    // other request.
-    let roots = state.review_roots.clone();
+    // The dropdown offers children of the **inventory root** only, down to
+    // telescope / object level (`root/tel`, `root/tel/obj`): the root itself
+    // and deeper subdirs (`master`, `*.pxiproject`, …) are not offered, and
+    // neither is staging — frames move *out of* staging, never into it. Any
+    // other directory inside the root can still arrive via `/review/destinfo`.
+    // A bounded read_dir walk, deliberately NOT get_records(): that path
+    // takes a std Mutex across a traverse measured at ~48 s, which would
+    // stall every other request.
+    let roots = vec![state.root.clone()];
     let dirs = tokio::task::spawn_blocking(move || review::list_destinations(&roots, 2_000, 2))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     state.set_dests(dirs.clone());
     Ok(Json(dirs))
+}
+
+/// Child **directory** names of `dir`, which must exist inside the inventory
+/// root. Powers the review page's drill-down dropdowns: one call per level,
+/// so the hierarchy can be walked without typing a path. Paths outside the
+/// root or that do not exist are rejected.
+async fn review_subdirs(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ReviewQuery>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let raw = q.dir.ok_or((StatusCode::BAD_REQUEST, "dir is required".to_string()))?;
+    let roots = vec![state.root.clone()];
+    let subs = tokio::task::spawn_blocking(move || review::list_subdirs(&roots, &raw, 500))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(subs))
 }
 
 #[derive(Serialize)]
@@ -1155,7 +1373,7 @@ async fn review_destinfo(
     Query(q): Query<ReviewQuery>,
 ) -> Result<Json<DestInfo>, (StatusCode, String)> {
     let raw = q.dir.ok_or((StatusCode::BAD_REQUEST, "dir is required".to_string()))?;
-    let cand = review::guard_new_dir(&state.review_roots, &raw)
+    let cand = review::guard_new_dir(std::slice::from_ref(&state.root), &raw)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let exists = cand.is_dir();
     let names = if exists {
@@ -1172,51 +1390,34 @@ async fn review_destinfo(
     }))
 }
 
-#[derive(Deserialize)]
-struct MkdirRequest {
-    dir: String,
+/// Optional tidy-up after a move or a delete: plain `remove_dir`, so a
+/// directory that still holds unmarked files fails safely and the reason is
+/// reported. Review roots themselves are never removable.
+fn tidy_src_dir(dir: &std::path::Path, review_roots: &[PathBuf], report: &mut review::ApplyReport) {
+    if review_roots.iter().any(|r| r == dir) {
+        report.errors.push(format!(
+            "remove source dir {}: is a review root — not removed",
+            dir.display()
+        ));
+    } else if let Err(e) = std::fs::remove_dir(dir) {
+        report.errors.push(format!(
+            "remove source dir {}: {e}",
+            dir.display()
+        ));
+    }
 }
 
-/// Create a destination directory inside a review root, at any depth. The
-/// guard runs lexically before creation and the canonicalised result is
-/// re-checked after, so a symlinked component cannot smuggle the new dir out
-/// of the root.
-async fn review_mkdir(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<MkdirRequest>,
-) -> Result<Json<review::Destination>, (StatusCode, String)> {
-    let roots = state.review_roots.clone();
-    let roots_for_label = roots.clone();
-    let raw = req.dir.clone();
-    let created = tokio::task::spawn_blocking(move || review::create_dest_dir(&roots, &raw))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-
-    state.invalidate_dests();
-    state.cache.lock().unwrap().records = None;
-
-    // Label exactly as `list_destinations` does (`root/rel`), so the JS can
-    // select the new option by path without a label mismatch.
-    let label = roots_for_label
-        .iter()
-        .filter_map(|r| std::fs::canonicalize(r).ok())
-        .find_map(|rr| {
-            created.strip_prefix(&rr).ok().map(|rel| {
-                let root_name = rr.file_name().unwrap_or_default().to_string_lossy().to_string();
-                if rel.as_os_str().is_empty() {
-                    root_name
-                } else {
-                    format!("{root_name}/{}", rel.to_string_lossy())
-                }
-            })
-        })
-        .unwrap_or_else(|| created.to_string_lossy().into_owned());
-    Ok(Json(review::Destination {
-        label,
-        name: created.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-        path: created.to_string_lossy().into_owned(),
-    }))
+/// The in-flight apply job, for the page's progress bar: `{total, done}`
+/// while an apply is running, `null` when idle.
+async fn review_progress(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let guard = state.apply_progress.lock().unwrap();
+    match guard.as_ref() {
+        Some((total, done)) => Json(serde_json::json!({
+            "total": total,
+            "done": done.load(std::sync::atomic::Ordering::Relaxed),
+        })),
+        None => Json(serde_json::Value::Null),
+    }
 }
 
 async fn review_apply(
@@ -1240,7 +1441,7 @@ async fn review_apply(
                 StatusCode::BAD_REQUEST,
                 "a destination is required for this operation".to_string(),
             ))?;
-        state.review_path(raw)?;
+        state.dest_path(raw)?;
         Some(raw.to_string())
     } else {
         None
@@ -1255,14 +1456,25 @@ async fn review_apply(
     state.manifest_for(&dir);
     let keys = state.snapshot_keys(&dir_key, &processed);
 
-    let roots = state.review_roots.clone();
+    let roots = vec![state.root.clone()];
     let files = processed.clone();
-    let report = tokio::task::spawn_blocking(move || {
-        review::apply(&dir, &roots, op, dst.as_deref(), &files)
+    let remove_src = req.remove_src_dir;
+    let dir_for_apply = dir.clone();
+    // Publish progress for the duration of the job so the page can draw a bar.
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    *state.apply_progress.lock().unwrap() = Some((processed.len(), counter.clone()));
+    let counter_for_apply = counter.clone();
+    let mut report = tokio::task::spawn_blocking(move || {
+        review::apply(&dir_for_apply, &roots, op, dst.as_deref(), &files, Some(&counter_for_apply))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    *state.apply_progress.lock().unwrap() = None;
 
+    // Optional tidy-up after a move or a delete.
+    if matches!(op, review::Op::Move | review::Op::Delete) && remove_src && report.touched() > 0 {
+        tidy_src_dir(&dir, &state.review_roots, &mut report);
+    }
     state.drop_frames_from_manifest(&dir_key, &processed);
     if let Some(p) = &state.previews {
         p.drop_keys(&keys);
@@ -1321,6 +1533,73 @@ mod tests {
         );
     }
 
+    /// The config telescope map translates staging folder names (mount-based)
+    /// into inventory ones (instrument-based): both the dropdown scope and the
+    /// preselect follow the mapping, unmapped names fall back to name equality,
+    /// and staging folders with no inventory twin drop out of the scope.
+    #[test]
+    fn staging_move_hint_follows_the_config_telescope_map() {
+        let root = scratch("hintmap");
+        for t in ["10RC", "8RC"] {
+            std::fs::create_dir_all(root.join(t)).unwrap();
+        }
+        let staging = root.join("staging");
+        for t in ["Pier", "RC", "GT81"] {
+            std::fs::create_dir_all(staging.join(t).join("Darks")).unwrap();
+        }
+        let mut tel_map = HashMap::new();
+        tel_map.insert("Pier".into(), "10RC".into());
+        tel_map.insert("RC".into(), "8RC".into());
+        let state = AppState::new(
+            root.clone(),
+            20,
+            0.0,
+            0.0,
+            root.join("compendium"),
+            Some(staging.clone()),
+            root.join("cache"),
+            vec![root.clone(), staging.clone()],
+            500,
+            tel_map,
+        );
+        let (tels, suggest) = state.staging_move_hint(&staging.join("Pier/Darks")).unwrap();
+        assert_eq!(
+            tels,
+            vec!["10RC".to_string(), "8RC".to_string()],
+            "mapped telescopes form the scope; GT81 has no inventory twin and drops out"
+        );
+        assert_eq!(suggest.as_deref(), Some("10RC"), "Pier preselects 10RC");
+        // Unmapped staging names keep the old name-equality behaviour.
+        let (_, suggest) = state.staging_move_hint(&staging.join("GT81/Darks")).unwrap();
+        assert_eq!(suggest, None);
+        // Not under staging at all -> no hint.
+        assert!(state.staging_move_hint(&root.join("10RC")).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The post-apply tidy-up: empty directories go, non-empty ones fail
+    /// safely with a reported reason, and a review root is never removed.
+    #[test]
+    fn tidy_src_dir_removes_only_empty_dirs_and_never_a_review_root() {
+        let root = scratch("tidy");
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let full = root.join("full");
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("keep.fits"), b"x").unwrap();
+        let mut rep = review::ApplyReport::default();
+        tidy_src_dir(&empty, &[root.clone()], &mut rep);
+        assert!(!empty.exists(), "an emptied directory is removed");
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        tidy_src_dir(&full, &[root.clone()], &mut rep);
+        assert!(full.exists(), "a directory that still holds files is kept");
+        assert!(rep.errors.iter().any(|e| e.contains("remove source dir")), "{:?}", rep.errors);
+        tidy_src_dir(&root, &[root.clone()], &mut rep);
+        assert!(root.exists(), "a review root is never removed");
+        assert!(rep.errors.iter().any(|e| e.contains("review root")), "{:?}", rep.errors);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "astro_newdest_{}_{}",
@@ -1336,7 +1615,7 @@ mod tests {
     fn create_object_makes_the_dir_and_plan_md() {
         let root = scratch("basic");
         let meta = EMPTY_META;
-        let created = create_object(&root, "81GT", "Jacoby1", &meta).unwrap();
+        let created = create_object(&root, "81GT", "Jacoby1", &meta, true).unwrap();
         assert_eq!(created, root.join("81GT").join("Jacoby1"));
         assert!(created.is_dir());
         let plan = std::fs::read_to_string(created.join("plan.md")).unwrap();
@@ -1354,7 +1633,7 @@ mod tests {
             rotation: "",
             sample: "",
         };
-        let created = create_object(&root, "81GT", "M39", &meta).unwrap();
+        let created = create_object(&root, "81GT", "M39", &meta, true).unwrap();
         let plan = std::fs::read_to_string(created.join("plan.md")).unwrap();
         assert!(plan.starts_with("---\nconstellation: "), "{plan}");
         assert!(plan.contains("ra: 20h"), "{plan}");
@@ -1366,9 +1645,9 @@ mod tests {
     fn create_object_refuses_names_that_escape() {
         let root = scratch("escape");
         let meta = EMPTY_META;
-        for bad in ["..", "../81GT", "a/b", "a\\b", ".", "\0"] {
+        for bad in ["..", "../81GT", "a/../b", "a\\b", ".", "\0", "a//b"] {
             assert!(
-                create_object(&root, "81GT", bad, &meta).is_err(),
+                create_object(&root, "81GT", bad, &meta, true).is_err(),
                 "accepted {bad:?}"
             );
         }
@@ -1382,11 +1661,125 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_object_name_keeps_only_alphanumerics() {
+        assert_eq!(sanitize_object_name("NGC 7331 (Marat)"), "NGC_7331_Marat");
+        assert_eq!(sanitize_object_name("M31"), "M31");
+        assert_eq!(sanitize_object_name("M31--And."), "M31_And");
+        assert_eq!(sanitize_object_name("  Abell  01  "), "Abell_01");
+        // Accented Latin letters fold to their ASCII spelling, not to `_`.
+        assert_eq!(sanitize_object_name("Andromède"), "Andromede");
+        assert_eq!(sanitize_object_name("Céphée"), "Cephee");
+        assert_eq!(sanitize_object_name("Müller"), "Muller");
+        assert_eq!(sanitize_object_name("Å"), "A");
+        assert_eq!(sanitize_object_name("Æon"), "AEon");
+        assert_eq!(sanitize_object_name("straße"), "strasse");
+        assert_eq!(sanitize_object_name("Østfold"), "Ostfold");
+        assert_eq!(sanitize_object_name("Łódź"), "Lodz");
+        assert_eq!(sanitize_object_name("Dvořák"), "Dvorak");
+        // Non-Latin scripts have no ASCII spelling and become `_`; a leading `_`
+        // is then trimmed, so `М31` lands as `31`.
+        assert_eq!(sanitize_object_name("М31"), "31");
+        assert_eq!(sanitize_object_name("М31 М32"), "31_32");
+        // `/` is the nesting separator, not a character to convert.
+        assert_eq!(sanitize_object_name("M42/deep/sub"), "M42/deep/sub");
+        assert_eq!(sanitize_object_name("M42 /deep/ sub "), "M42/deep/sub");
+        assert_eq!(sanitize_object_name("M42 Céphée deep"), "M42_Cephee_deep");
+        assert_eq!(sanitize_object_name("!!!"), "");
+        // Idempotent, including on accented input: handlers normalise before
+        // create_object normalises again.
+        for s in ["NGC 7331 (Marat)", "Andromède", "M42 Céphée deep"] {
+            let once = sanitize_object_name(s);
+            assert_eq!(sanitize_object_name(&once), once, "{s}");
+        }
+    }
+
+    #[test]
+    fn create_object_folds_accents_into_the_directory_and_the_heading() {
+        let root = scratch("accent");
+        let meta = EMPTY_META;
+        let created = create_object(&root, "81GT", "Céphée (Flamsteed)", &meta, true).unwrap();
+        assert_eq!(created, root.join("81GT").join("Cephee_Flamsteed"));
+        let plan = std::fs::read_to_string(created.join("plan.md")).unwrap();
+        assert_eq!(plan, "# Cephee_Flamsteed\n\n## Plan\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn create_object_sanitises_the_directory_and_the_plan_heading() {
+        let root = scratch("sanitise");
+        let meta = EMPTY_META;
+        let created = create_object(&root, "81GT", "NGC 7331 (Marat)", &meta, true).unwrap();
+        assert_eq!(created, root.join("81GT").join("NGC_7331_Marat"));
+        // The heading uses the name that was created, not the typed one.
+        let plan = std::fs::read_to_string(created.join("plan.md")).unwrap();
+        assert_eq!(plan, "# NGC_7331_Marat\n\n## Plan\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn create_object_sanitises_each_nested_segment() {
+        let root = scratch("nested_sanitise");
+        let meta = EMPTY_META;
+        let created = create_object(&root, "81GT", "M42 deep/sub dir", &meta, true).unwrap();
+        assert_eq!(created, root.join("81GT").join("M42_deep/sub_dir"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn create_object_refuses_a_name_that_sanitises_to_nothing() {
+        let root = scratch("empty_name");
+        let meta = EMPTY_META;
+        for bad in ["!!!", "(( ))", "!!!/x", "///"] {
+            assert!(
+                create_object(&root, "81GT", bad, &meta, true).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(root.join("81GT")).unwrap().count(),
+            0,
+            "a rejected name still created something"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn create_object_nests_deeper_names_with_plan_md_at_the_leaf() {
+        let root = scratch("nested");
+        let meta = EMPTY_META;
+        let created = create_object(&root, "81GT", "M42/deep/sub", &meta, true).unwrap();
+        assert!(created.is_dir(), "every intermediate level is created");
+        assert!(
+            created.join("plan.md").is_file(),
+            "plan.md belongs at the leaf, as for a top-level object"
+        );
+        // An escaping segment inside a nested name is refused, and the
+        // escape target is never created.
+        assert!(create_object(&root, "81GT", "M42/../../x", &meta, true).is_err());
+        assert!(!root.join("x").exists());
+        // A nested name that already exists is refused like any other.
+        assert!(create_object(&root, "81GT", "M42/deep/sub", &meta, true).is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The move screen creates bare landing folders: no `plan.md`, unlike the
+    /// index form.
+    #[test]
+    fn create_object_without_plan_leaves_no_plan_md() {
+        let root = scratch("noplan");
+        let created = create_object(&root, "81GT", "Landing", &EMPTY_META, false).unwrap();
+        assert!(created.is_dir());
+        assert!(!created.join("plan.md").exists(), "move destinations must not grow a plan.md");
+        assert!(root.join("81GT").join("Landing").is_dir());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn create_object_refuses_a_telescope_that_is_not_a_directory() {
         let root = scratch("tel");
         let meta = EMPTY_META;
-        assert!(create_object(&root, "Pier", "X", &meta).is_err());
-        assert!(create_object(&root, "../RC", "X", &meta).is_err());
+        assert!(create_object(&root, "Pier", "X", &meta, true).is_err());
+        assert!(create_object(&root, "../RC", "X", &meta, true).is_err());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1394,8 +1787,8 @@ mod tests {
     fn create_object_never_adopts_an_existing_directory() {
         let root = scratch("exists");
         let meta = EMPTY_META;
-        assert!(create_object(&root, "81GT", "Dup", &meta).is_ok());
-        let err = create_object(&root, "81GT", "Dup", &meta).unwrap_err();
+        assert!(create_object(&root, "81GT", "Dup", &meta, true).is_ok());
+        let err = create_object(&root, "81GT", "Dup", &meta, true).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
