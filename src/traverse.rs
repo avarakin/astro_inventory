@@ -67,6 +67,9 @@ pub struct ObjectRecord {
     pub size_bytes: u64,
     pub final_images: Vec<String>,
     pub plan: Option<String>,
+    /// `plan.md` carries a TODO marker/section. Those objects are pinned to
+    /// the top of the inventory list.
+    pub has_todo: bool,
     pub plan_mtime: Option<DateTime<Local>>,
     pub transit: Option<String>,
     pub transit_sort: f64,
@@ -273,6 +276,7 @@ pub fn traverse(root: &Path, longitude: f64) -> Vec<ObjectRecord> {
                 size_bytes: 0,
                 final_images: Vec::new(),
                 plan: None,
+                has_todo: false,
                 plan_mtime: None,
                 transit: None,
                 transit_sort: 0.0,
@@ -295,6 +299,7 @@ pub fn traverse(root: &Path, longitude: f64) -> Vec<ObjectRecord> {
 
                 match std::fs::read_to_string(&plan_path) {
                     Ok(text) => {
+                        rec.has_todo = crate::plan::has_todo_section(&text);
                         rec.plan = Some(text.clone());
                     }
                     Err(_) => {
@@ -558,13 +563,23 @@ pub fn build_row(
     let transit_disp = rec.transit.as_deref().unwrap_or("—");
     let transit_sort = rec.transit_sort;
 
+    // A visible marker explains why a row sits above the current sort order.
+    let object_disp = if rec.has_todo {
+        format!(
+            "{} <span class=\"badge badge-todo\" title=\"plan.md has a TODO section\">TODO</span>",
+            html_escape(&rec.object)
+        )
+    } else {
+        html_escape(&rec.object)
+    };
+
     format!(
-        "<tr class=\"{cls}\">\
+        "<tr class=\"{cls}\" data-todo=\"{todo}\">\
          <td data-sort=\"{p_sort}\">{p_disp}</td>\
          <td data-sort=\"{f_sort}\">{f_disp}</td>\
          <td data-sort=\"{ts_sort}\">{}</td>\
          <td data-sort=\"{}\">{}</td>\
-         <td data-sort=\"{}\">{}</td>\
+         <td data-sort=\"{}\">{object_disp}</td>\
          <td data-sort=\"{transit_sort}\">{}</td>\
          <td data-sort=\"{total_sec}\">{}</td>\
          <td data-sort=\"{size_mb:.6}\">{size_mb:.1}</td>\
@@ -577,8 +592,40 @@ pub fn build_row(
         html_escape(&rec.telescope),
         html_escape(&rec.telescope),
         html_escape(&rec.object),
-        html_escape(&rec.object),
         html_escape(transit_disp),
         fmt_total(Some(total_sec)),
+        todo = if rec.has_todo { "1" } else { "0" },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "astro_traverse_test_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn traverse_marks_records_whose_plan_has_a_todo() {
+        let root = scratch("todo");
+        let todo_dir = root.join("10RC").join("M42");
+        std::fs::create_dir_all(&todo_dir).unwrap();
+        std::fs::write(todo_dir.join("plan.md"), "TODO: take RGB\nRotation: 85\n").unwrap();
+        let done_dir = root.join("10RC").join("M31");
+        std::fs::create_dir_all(&done_dir).unwrap();
+        std::fs::write(done_dir.join("plan.md"), "## Plan\nTake RGB\n").unwrap();
+
+        let records = traverse(&root, 0.0);
+        let by_name = |name: &str| records.iter().find(|r| r.object == name).unwrap();
+        assert!(by_name("M42").has_todo, "TODO plan must be marked");
+        assert!(!by_name("M31").has_todo, "ordinary plan must not be marked");
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

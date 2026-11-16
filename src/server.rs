@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use crate::plan::expand_constellation;
 use crate::render::{
-    col_by_key, page_size_control, render_edit_page, render_header_cells, render_index_page,
-    render_pager, render_review, render_review_index, sort_records,
+    col_by_key, filter_query_suffix, page_size_control, record_matches_filters, render_edit_page,
+    render_filter_bar, render_header_cells, render_index_page, render_pager, render_review,
+    render_review_index, sort_records,
 };
 use crate::traverse::{build_row, traverse, ObjectRecord};
 use crate::review::{self, Manifest, PreviewCache, PreviewState};
@@ -299,6 +300,12 @@ struct IndexQuery {
     page: Option<usize>,
     page_size: Option<usize>,
     refresh: Option<String>,
+    /// Filter: only directories with total exposure strictly above this many
+    /// hours. Kept as a string because the filter form submits an empty value
+    /// for "Any exposure", which would fail to deserialize into a number.
+    min_hours: Option<String>,
+    /// Filter: `"1"` keeps only project directories with no master image.
+    missing_master: Option<String>,
 }
 
 // --- Flash message via cookie ---
@@ -308,6 +315,19 @@ fn flash_cookie(cat: &str, msg: &str) -> String {
 }
 
 // --- Routes ---
+
+/// Parse the inventory filter query. Only the three offered thresholds are
+/// accepted: a hand-edited URL cannot leave the select showing "Any exposure"
+/// while the table is filtered by an invisible value.
+fn parse_index_filters(
+    min_hours: Option<&str>,
+    missing_master: Option<&str>,
+) -> (Option<u32>, bool) {
+    let hours = min_hours
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|h| matches!(h, 0 | 1 | 10));
+    (hours, missing_master == Some("1"))
+}
 
 async fn index(
     State(state): State<Arc<AppState>>,
@@ -323,6 +343,11 @@ async fn index(
         v.sort();
         v
     };
+
+    let (min_hours, missing_master) =
+        parse_index_filters(params.min_hours.as_deref(), params.missing_master.as_deref());
+    let total_all = records.len();
+    records.retain(|rec| record_matches_filters(rec, min_hours, missing_master));
 
     // Sort
     let sort_key = params.sort.as_deref().unwrap_or("latest");
@@ -393,15 +418,29 @@ async fn index(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Keep the active filters on every generated link, so sorting, paging,
+    // changing the page size, or refreshing does not silently widen the view.
+    let filter_query = filter_query_suffix(min_hours, missing_master);
+
     let refresh_url = format!(
-        "?sort={sort_key}&dir={direction}&page=1&page_size={page_size}&refresh=1"
+        "?sort={sort_key}&dir={direction}&page=1&page_size={page_size}{filter_query}&refresh=1"
     );
 
-    let header_cells = render_header_cells(sort_key, direction, page_size);
+    let filter_bar = render_filter_bar(
+        min_hours,
+        missing_master,
+        sort_key,
+        direction,
+        page_size,
+        total,
+        total_all,
+    );
 
-    let pager = page_size_control(page_size, sort_key, direction)
+    let header_cells = render_header_cells(sort_key, direction, page_size, &filter_query);
+
+    let pager = page_size_control(page_size, sort_key, direction, &filter_query)
         + " "
-        + &render_pager(page, pages, total, sort_key, direction, page_size);
+        + &render_pager(page, pages, total, sort_key, direction, page_size, &filter_query);
 
     let generated_str = generated.format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -412,10 +451,12 @@ async fn index(
         &state.root.to_string_lossy(),
         &format!("{:.2}, {:.2}", state.latitude, state.longitude),
         total,
+        total_all,
         &generated_str,
         &telescope_options,
         &flashes,
         &refresh_url,
+        &filter_bar,
         &header_cells,
         &rows.join("\n"),
         &pager,
@@ -1496,6 +1537,19 @@ async fn review_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The filter query tolerates the form's empty "Any" values and refuses
+    /// thresholds the UI does not offer.
+    #[test]
+    fn index_filters_accept_only_the_offered_values() {
+        assert_eq!(parse_index_filters(Some("0"), None), (Some(0), false));
+        assert_eq!(parse_index_filters(Some("1"), Some("1")), (Some(1), true));
+        assert_eq!(parse_index_filters(Some("10"), Some("")), (Some(10), false));
+        assert_eq!(parse_index_filters(Some(""), Some("0")), (None, false));
+        assert_eq!(parse_index_filters(Some("5"), None), (None, false));
+        assert_eq!(parse_index_filters(Some("abc"), None), (None, false));
+        assert_eq!(parse_index_filters(None, None), (None, false));
+    }
 
     /// AstroBin encodes coordinates as decimal-degree *strings* (`"ra":
     /// "25.760"`); the reader must accept both strings and JSON numbers.

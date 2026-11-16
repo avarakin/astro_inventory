@@ -70,6 +70,7 @@ pub const CSS: &str = r#"
   .plan { font-size: 12px; }
   .plan-top { margin-bottom: 4px; }
   .badge { display: inline-block; background: var(--accent-2); color: #fff; border-radius: 10px; padding: 2px 9px; font-size: 11px; font-weight: 600; margin-right: 6px; }
+  .badge-todo { background: var(--warn-fg); color: #221a00; margin-left: 6px; margin-right: 0; }
   .plan-link { display: inline-block; padding: 2px 10px; background: var(--accent-2); color: #fff; border-radius: 10px; text-decoration: none; font-size: 11px; font-weight: 600; }
   .plan-link:hover { background: var(--accent); }
   .plan-body { margin: 2px 0; line-height: 1.4; }
@@ -94,6 +95,24 @@ pub const CSS: &str = r#"
   .addbox button[type=button]:hover { border-color: var(--accent); color: var(--accent); }
   .addbox button[type=submit] { background: var(--accent-2); color: #fff; }
   .addbox button[type=submit]:hover { background: var(--accent); }
+  .filters {
+    display: flex; align-items: center; gap: 0.7em; flex-wrap: wrap;
+    border: 1px solid var(--border); border-radius: 12px; padding: 0.8em 1.2em;
+    margin-bottom: 1.2em; background: var(--panel);
+  }
+  .filters label { color: var(--muted); font-size: 13px; }
+  .filters select {
+    padding: 7px 9px; font-size: 14px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .filters select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124, 140, 255, 0.2); }
+  .filters button {
+    padding: 7px 16px; font-size: 14px; cursor: pointer; border: none;
+    border-radius: 8px; font-weight: 600; background: var(--accent-2); color: #fff;
+  }
+  .filters button:hover { background: var(--accent); }
+  .filters a.clear { font-size: 13px; }
+  .filters .filters-summary { margin-left: auto; color: var(--muted); font-size: 13px; }
   .flash { margin: 0.6em 0 0; padding: 0.6em 1em; border-radius: 8px; font-size: 14px; }
   .flash.ok { background: var(--ok-bg); color: var(--ok-fg); border: 1px solid #1d5c39; }
   .flash.error { background: var(--err-bg); color: var(--err-fg); border: 1px solid #6b2737; }
@@ -152,6 +171,14 @@ pub fn sort_records(records: &mut Vec<ObjectRecord>, key: &str, direction: &str)
     let reverse = direction == "desc";
 
     records.sort_by(|a, b| {
+        // Objects whose plan has a TODO section stay at the top of the list,
+        // regardless of the selected column or direction. The comparison is
+        // made before the direction is applied, so descending order cannot
+        // push the TODO group to the bottom.
+        let pinned = b.has_todo.cmp(&a.has_todo);
+        if pinned != std::cmp::Ordering::Equal {
+            return pinned;
+        }
         let cmp = match key {
             "project" => {
                 let av = if a.has_project { 1 } else { 0 };
@@ -197,6 +224,96 @@ fn rec_transit_sort(rec: &ObjectRecord) -> f64 {
     rec.transit_sort
 }
 
+/// Query-string suffix carrying the active inventory filters. Every generated
+/// link (sort headers, pager, page size, refresh) must include it, otherwise a
+/// click would silently drop the filter.
+pub fn filter_query_suffix(min_hours: Option<u32>, missing_master: bool) -> String {
+    let mut suffix = String::new();
+    if let Some(hours) = min_hours {
+        suffix.push_str(&format!("&min_hours={hours}"));
+    }
+    if missing_master {
+        suffix.push_str("&missing_master=1");
+    }
+    suffix
+}
+
+/// Does a record pass the index filters? Filters combine with AND.
+///
+/// `min_hours` keeps directories whose total exposure is **strictly** above
+/// the threshold. `missing_master` keeps project directories with no image in
+/// `master/` — the same condition that paints a row yellow.
+pub fn record_matches_filters(
+    rec: &ObjectRecord,
+    min_hours: Option<u32>,
+    missing_master: bool,
+) -> bool {
+    if let Some(hours) = min_hours {
+        if crate::traverse::total_seconds(rec) <= hours as f64 * 3600.0 {
+            return false;
+        }
+    }
+    if missing_master && !(rec.has_project && !rec.has_final) {
+        return false;
+    }
+    true
+}
+
+/// The filter form shown above the inventory table. A GET form keeps the
+/// filters bookmarkable and shareable, and the hidden inputs preserve the
+/// current sort and page size when the filters are applied.
+pub fn render_filter_bar(
+    min_hours: Option<u32>,
+    missing_master: bool,
+    sort_key: &str,
+    direction: &str,
+    page_size: usize,
+    shown: usize,
+    total: usize,
+) -> String {
+    let hour_options = [
+        (None, "Any exposure"),
+        (Some(0u32), "More than 0 hours"),
+        (Some(1), "More than 1 hour"),
+        (Some(10), "More than 10 hours"),
+    ];
+    let hour_opts: Vec<String> = hour_options
+        .iter()
+        .map(|(value, label)| {
+            let selected = if *value == min_hours { " selected" } else { "" };
+            let value = value.map(|v| v.to_string()).unwrap_or_default();
+            format!(
+                "<option value=\"{value}\"{selected}>{label}</option>"
+            )
+        })
+        .collect();
+    let any_status = if missing_master { "" } else { " selected" };
+    let missing_status = if missing_master { " selected" } else { "" };
+    let clear_url = format!(
+        "/?sort={sort_key}&dir={direction}&page=1&page_size={page_size}"
+    );
+
+    format!(
+        "<form class=\"filters\" method=\"get\" action=\"/\">\
+         <input type=\"hidden\" name=\"sort\" value=\"{sort_key}\">\
+         <input type=\"hidden\" name=\"dir\" value=\"{direction}\">\
+         <input type=\"hidden\" name=\"page_size\" value=\"{page_size}\">\
+         <label for=\"min_hours\">Total exposure:</label>\
+         <select name=\"min_hours\" id=\"min_hours\" title=\"Only directories with more total exposure than this\">{hour_opts}</select>\
+         <label for=\"missing_master\">Status:</label>\
+         <select name=\"missing_master\" id=\"missing_master\" title=\"Filter by project and master-image presence\">\
+         <option value=\"\"{any_status}>Any status</option>\
+         <option value=\"1\"{missing_status}>Project present, master image missing</option>\
+         </select>\
+         <button type=\"submit\" title=\"Apply the selected filters\">Apply filters</button>\
+         <a class=\"clear\" href=\"{clear_url}\" title=\"Remove all filters\">Clear</a>\
+         <span class=\"filters-summary\">Showing {shown} of {total} directories</span>\
+         </form>",
+        hour_opts = hour_opts.join(""),
+        clear_url = html_escape(&clear_url),
+    )
+}
+
 /// Build the pager HTML.
 pub fn render_pager(
     page: usize,
@@ -205,6 +322,7 @@ pub fn render_pager(
     sort_key: &str,
     direction: &str,
     page_size: usize,
+    filter_query: &str,
 ) -> String {
     if page_size == 0 {
         return format!("<span>{total} objects (paging disabled)</span>");
@@ -212,7 +330,7 @@ pub fn render_pager(
 
     let pager_url = |page: usize| -> String {
         format!(
-            "?sort={sort_key}&dir={direction}&page={page}&page_size={page_size}"
+            "?sort={sort_key}&dir={direction}&page={page}&page_size={page_size}{filter_query}"
         )
     };
 
@@ -267,6 +385,7 @@ pub fn page_size_control(
     page_size: usize,
     sort_key: &str,
     direction: &str,
+    filter_query: &str,
 ) -> String {
     let options = [(10usize, "10"), (20, "20"), (50, "50"), (100, "100"), (0, "All (no paging)")];
     let opts: Vec<String> = options
@@ -278,7 +397,7 @@ pub fn page_size_control(
         .collect();
 
     let base = format!(
-        "?sort={sort_key}&dir={direction}&page=1"
+        "?sort={sort_key}&dir={direction}&page=1{filter_query}"
     );
 
     format!(
@@ -294,6 +413,7 @@ pub fn render_header_cells(
     sort_key: &str,
     direction: &str,
     page_size: usize,
+    filter_query: &str,
 ) -> String {
     let mut cells = Vec::new();
 
@@ -312,12 +432,12 @@ pub fn render_header_cells(
             let other_dir = if direction == "asc" { "desc" } else { "asc" };
             let url = if col.key == sort_key {
                 format!(
-                    "?sort={}&dir={}&page=1&page_size={}",
+                    "?sort={}&dir={}&page=1&page_size={}{filter_query}",
                     col.key, other_dir, page_size
                 )
             } else {
                 format!(
-                    "?sort={}&dir={}&page=1&page_size={}",
+                    "?sort={}&dir={}&page=1&page_size={}{filter_query}",
                     col.key, col.default_dir, page_size
                 )
             };
@@ -343,14 +463,21 @@ pub fn render_index_page(
     root: &str,
     location: &str,
     total: usize,
+    total_all: usize,
     generated: &str,
     telescope_options: &str,
     flashes: &str,
     refresh_url: &str,
+    filter_bar: &str,
     header_cells: &str,
     rows: &str,
     pager: &str,
 ) -> String {
+    let objects = if total == total_all {
+        format!("Objects: {total}")
+    } else {
+        format!("Objects: {total} of {total_all}")
+    };
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -362,7 +489,7 @@ pub fn render_index_page(
 <body>
 {navbar}
 <h1>Astro Imaging Tracker</h1>
-<p class="meta">Root: {root} &middot; Location: {location} &middot; Objects: {n} &middot; Generated: {gen}<br>
+<p class="meta">Root: {root} &middot; Location: {location} &middot; {objects} &middot; Generated: {gen}<br>
 Click a column header to sort. <a href="{refresh_url}">Refresh scan</a></p>
 
 <div class="addbox">
@@ -418,6 +545,8 @@ Click a column header to sort. <a href="{refresh_url}">Refresh scan</a></p>
   {flashes}
 </div>
 
+{filter_bar}
+
 <p class="pager">{pager}</p>
 
 <table id="report">
@@ -437,11 +566,12 @@ Click a column header to sort. <a href="{refresh_url}">Refresh scan</a></p>
 "#,
         css = CSS,
         root = html_escape(root),
-        n = total,
+        objects = objects,
         gen = html_escape(generated),
         refresh_url = html_escape(refresh_url),
         telescope_options = telescope_options,
         flashes = flashes,
+        filter_bar = filter_bar,
         pager = pager,
         header_cells = header_cells,
         rows = rows,
@@ -1496,6 +1626,152 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    fn record_with_exposure(seconds: f64, has_project: bool, has_final: bool) -> ObjectRecord {
+        use crate::traverse::FilterStats;
+        use std::collections::BTreeMap;
+
+        let mut filters = BTreeMap::new();
+        filters.insert(
+            "L".to_string(),
+            FilterStats {
+                count: 1,
+                seconds,
+                durations: BTreeMap::new(),
+            },
+        );
+        ObjectRecord {
+            telescope: "10RC".to_string(),
+            object: "M42".to_string(),
+            path: std::path::PathBuf::from("/data/Astro/CCD/10RC/M42"),
+            filters,
+            cr2cr3_count: 0,
+            latest: None,
+            has_project,
+            has_final,
+            size_bytes: 0,
+            final_images: Vec::new(),
+            plan: None,
+            has_todo: false,
+            plan_mtime: None,
+            transit: None,
+            transit_sort: 0.0,
+        }
+    }
+
+    /// Exposure filters are strict (`>` not `>=`) and combine with the
+    /// project-without-master filter using AND.
+    #[test]
+    fn filters_keep_total_exposure_above_the_threshold_and_missing_masters() {
+        let no_exposure = record_with_exposure(0.0, false, false);
+        let exactly_1h = record_with_exposure(3600.0, false, false);
+        let over_1h = record_with_exposure(3600.1, false, false);
+        let over_10h_no_master = record_with_exposure(10.0 * 3600.0 + 1.0, true, false);
+        let over_10h_with_master = record_with_exposure(10.0 * 3600.0 + 1.0, true, true);
+
+        assert!(!record_matches_filters(&no_exposure, Some(0), false), "0h exactly is not > 0h");
+        assert!(record_matches_filters(&exactly_1h, Some(0), false));
+        assert!(!record_matches_filters(&exactly_1h, Some(1), false), "1h exactly is not > 1h");
+        assert!(record_matches_filters(&over_1h, Some(1), false));
+        assert!(record_matches_filters(&over_10h_no_master, Some(10), false));
+        assert!(!record_matches_filters(&over_1h, Some(10), false));
+
+        // Missing master = project present, final image absent.
+        assert!(record_matches_filters(&over_10h_no_master, None, true));
+        assert!(!record_matches_filters(&over_10h_with_master, None, true));
+        assert!(!record_matches_filters(&over_1h, None, true), "no project");
+        assert!(record_matches_filters(&over_10h_no_master, Some(1), true));
+        assert!(
+            !record_matches_filters(&over_1h, Some(10), true),
+            "filters must AND"
+        );
+    }
+
+    /// The filter form must show the active selection, preserve sort/page
+    /// size, and report how many directories survived the filter.
+    #[test]
+    fn filter_bar_shows_the_active_selection_and_the_filtered_count() {
+        let html = render_filter_bar(Some(10), true, "latest", "desc", 20, 7, 300);
+        assert!(html.contains("<option value=\"10\" selected>More than 10 hours</option>"));
+        assert!(html.contains(
+            "<option value=\"1\" selected>Project present, master image missing</option>"
+        ));
+        assert!(html.contains("Showing 7 of 300 directories"));
+        assert!(html.contains("name=\"sort\" value=\"latest\""));
+        assert!(html.contains("name=\"dir\" value=\"desc\""));
+        assert!(html.contains("name=\"page_size\" value=\"20\""));
+
+        let plain = render_filter_bar(None, false, "latest", "desc", 20, 300, 300);
+        assert!(plain.contains("<option value=\"\" selected>Any exposure</option>"));
+        assert!(plain.contains("<option value=\"\" selected>Any status</option>"));
+    }
+
+    /// Once a filter is active, sorting/paging/page-size/refresh links must
+    /// carry it; otherwise a single click silently drops the filter.
+    #[test]
+    fn active_filters_survive_sort_pager_and_page_size_links() {
+        let q = filter_query_suffix(Some(10), true);
+        assert_eq!(q, "&min_hours=10&missing_master=1");
+
+        let headers = render_header_cells("latest", "desc", 20, &q);
+        assert!(headers.contains("min_hours=10&missing_master=1"), "sort links lose filters");
+
+        let pager = render_pager(2, 3, 50, "latest", "desc", 20, &q);
+        assert!(
+            pager.contains("page=3&page_size=20&min_hours=10&missing_master=1"),
+            "pager links lose filters"
+        );
+
+        let size = page_size_control(20, "latest", "desc", &q);
+        assert!(
+            size.contains("page=1&min_hours=10&missing_master=1&page_size="),
+            "page-size control loses filters"
+        );
+        assert_eq!(filter_query_suffix(None, false), "");
+    }
+
+    /// Plans with a TODO section are pinned above the sorted rows, and the
+    /// selected direction still orders rows within each group.
+    #[test]
+    fn todo_plans_are_pinned_to_the_top_in_both_sort_directions() {
+        let mut normal_big = record_with_exposure(20.0 * 3600.0, false, false);
+        normal_big.object = "NormalBig".to_string();
+        let mut todo_small = record_with_exposure(1.0 * 3600.0, false, false);
+        todo_small.object = "TodoSmall".to_string();
+        todo_small.has_todo = true;
+        let mut todo_big = record_with_exposure(10.0 * 3600.0, false, false);
+        todo_big.object = "TodoBig".to_string();
+        todo_big.has_todo = true;
+
+        let mut records = vec![normal_big, todo_small, todo_big];
+        sort_records(&mut records, "total", "desc");
+        assert_eq!(
+            records.iter().map(|r| r.object.as_str()).collect::<Vec<_>>(),
+            vec!["TodoBig", "TodoSmall", "NormalBig"],
+            "TODO rows must stay on top and sort descending within the group"
+        );
+        sort_records(&mut records, "total", "asc");
+        assert_eq!(
+            records.iter().map(|r| r.object.as_str()).collect::<Vec<_>>(),
+            vec!["TodoSmall", "TodoBig", "NormalBig"],
+            "TODO rows must stay on top when the direction reverses"
+        );
+        sort_records(&mut records, "object", "asc");
+        assert_eq!(
+            records.iter().map(|r| r.object.as_str()).collect::<Vec<_>>(),
+            vec!["TodoBig", "TodoSmall", "NormalBig"],
+            "the pin must survive every sort column"
+        );
+    }
+
+    /// The meta line distinguishes the filtered count from the full inventory.
+    #[test]
+    fn index_page_reports_the_filtered_count_and_the_total() {
+        let page = render_index_page("/r", "0.00, 0.00", 7, 300, "now", "", "", "?x", "", "", "", "");
+        assert!(page.contains("Objects: 7 of 300"));
+        let unfiltered = render_index_page("/r", "0.00, 0.00", 300, 300, "now", "", "", "?x", "", "", "", "");
+        assert!(unfiltered.contains("Objects: 300"));
+    }
+
     #[test]
     fn review_index_names_the_empty_case_without_breaking_the_table() {
         let html = render_review_index(&[std::path::PathBuf::from("/nowhere")], &[]);
@@ -1508,7 +1784,7 @@ mod tests {
     /// section shown as bold text rather than a link.
     #[test]
     fn global_navbar_appears_on_every_page() {
-        let index = render_index_page("/root", "0.00, 0.00", 1, "now", "", "", "?x", "", "", "");
+        let index = render_index_page("/root", "0.00, 0.00", 1, 1, "now", "", "", "?x", "", "", "", "");
         let edit = render_edit_page("scope", "M31", "/p", "plan", "");
         let staging = render_review_index(&[std::path::PathBuf::from("/nowhere")], &[]);
         let review = render_review("/nowhere", 500, None, None, false);

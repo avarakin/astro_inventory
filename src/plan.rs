@@ -137,6 +137,21 @@ pub fn parse_plan(text: &str) -> (HashMap<String, String>, String) {
     (HashMap::new(), text.to_string())
 }
 
+/// Does the plan text contain a TODO marker or section?
+///
+/// Plans in the wild put this on the first line (`TODO: take RGB`) and as a
+/// markdown heading (`## TODO`); list bullets and emphasis are tolerated.
+/// The marker must be a whole word, so `TODOS` or `TODOList` do not count.
+pub fn has_todo_section(text: &str) -> bool {
+    text.lines().any(|line| {
+        // Drop a markdown heading prefix and any bullet/emphasis wrapper.
+        let line = line.trim().trim_start_matches('#').trim();
+        line.split(|c: char| !c.is_alphanumeric())
+            .find(|word| !word.is_empty())
+            .map_or(false, |word| word.eq_ignore_ascii_case("todo"))
+    })
+}
+
 /// HTML-escape a string.
 pub fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -243,4 +258,31 @@ pub fn render_plan(plan_text: &str) -> String {
     }
 
     format!("<div class=\"plan\">{}</div>", parts.join(""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_todo_section;
+
+    #[test]
+    fn todo_markers_and_sections_are_detected() {
+        for text in [
+            "TODO: take RGB",
+            "TODO",
+            "## TODO\n- take RGB",
+            "### todo: take RGB",
+            "**TODO** take RGB",
+            "- [ ] TODO: take RGB",
+            "TODO:  Take RGB. Can be done from home\nRotation: 85",
+        ] {
+            assert!(has_todo_section(text), "missed TODO in {text:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_plan_text_is_not_a_todo() {
+        for text in ["", "## Plan\nTake RGB", "TODOS are useful", "No TODO here", "TODOList"] {
+            assert!(!has_todo_section(text), "false positive for {text:?}");
+        }
+    }
 }
