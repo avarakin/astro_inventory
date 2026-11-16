@@ -6,6 +6,7 @@ __pycache__/
 .location
 GeoLite2-City.mmdb
 server.log
+nohup.out
 
 
 # Added by cargo
