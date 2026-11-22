@@ -482,6 +482,8 @@ pub fn build_row(
     image_url_fn: &dyn Fn(&Path) -> String,
     actions_url_fn: &dyn Fn(&str, &str) -> (String, String),
     review_url_fn: &dyn Fn(&Path) -> String,
+    submit_url_fn: &dyn Fn(&str, &str) -> String,
+    submitted_slug_fn: &dyn Fn(&str, &str) -> Option<String>,
 ) -> String {
     let total_sec = total_seconds(rec);
 
@@ -548,17 +550,42 @@ pub fn build_row(
     let (edit_url, delete_url) = actions_url_fn(&rec.telescope, &rec.object);
     let review_url = review_url_fn(&rec.path);
     let obj_label = html_escape(&format!("{}/{}", rec.telescope, rec.object));
+    // AstroBin submission: only enabled when a master JPEG exists, because the
+    // upload engine has nothing to send without one. A recorded draft slug makes
+    // a double-submit visible.
+    let submit_url = submit_url_fn(&rec.telescope, &rec.object);
+    let submit_html = if rec.final_images.is_empty() {
+        "<button class=\"btn btn-edit\" disabled title=\"no master JPEG in master/\">AstroBin</button>".to_string()
+    } else {
+        format!(
+            "<button class=\"btn btn-edit\" onclick=\"location.href='{}'\">AstroBin</button>",
+            html_escape(&submit_url)
+        )
+    };
+    let submitted_badge = submitted_slug_fn(&rec.telescope, &rec.object).map(|slug| {
+        let slug = html_escape(&slug);
+        format!(
+            "<span class=\"badge\" title=\"AstroBin draft\"><a href=\"https://app.astrobin.com/i/{slug}\">{slug}</a></span>"
+        )
+    });
     let actions_html = format!(
         "<button class=\"btn btn-edit\" onclick=\"window.open('{}', '_blank')\">Edit plan</button> \
          <button class=\"btn btn-edit\" onclick=\"window.open('{}', '_blank')\">Review</button> \
+         {submit_html} \
          <button class=\"btn btn-del\" \
          onclick=\"if(confirm('Delete {} and all its files? This cannot be undone.'))document.getElementById('del_0').submit();return false\">Delete directory</button> \
          <form id=\"del_0\" method=\"post\" action=\"{}\" style=\"display:none\"><input type=\"hidden\" name=\"confirm\" value=\"yes\"></form>",
         html_escape(&edit_url),
         html_escape(&review_url),
         obj_label,
-        html_escape(&delete_url)
+        html_escape(&delete_url),
+        submit_html = submit_html,
     );
+    let actions_html = if let Some(badge) = submitted_badge {
+        format!("{actions_html} {badge}")
+    } else {
+        actions_html
+    };
 
     let transit_disp = rec.transit.as_deref().unwrap_or("—");
     let transit_sort = rec.transit_sort;

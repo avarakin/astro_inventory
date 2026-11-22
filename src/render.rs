@@ -1,4 +1,5 @@
 use crate::plan::html_escape;
+use crate::submit::{Job, Preflight, Submitted};
 use crate::traverse::ObjectRecord;
 use astro_inventory::nav::render_navbar;
 use chrono::{Local, TimeZone};
@@ -116,6 +117,9 @@ pub const CSS: &str = r#"
   .flash { margin: 0.6em 0 0; padding: 0.6em 1em; border-radius: 8px; font-size: 14px; }
   .flash.ok { background: var(--ok-bg); color: var(--ok-fg); border: 1px solid #1d5c39; }
   .flash.error { background: var(--err-bg); color: var(--err-fg); border: 1px solid #6b2737; }
+  /* Preflight state cells on the AstroBin submission page. */
+  td.ok { color: var(--ok-fg); font-weight: 600; }
+  td.bad { color: var(--err-fg); font-weight: 600; }
   .pager { margin: 1em 0; font-size: 14px; }
   .pager a, .pager span.cur {
     padding: 4px 11px; margin: 0 2px; border: 1px solid var(--border); border-radius: 8px;
@@ -224,16 +228,67 @@ fn rec_transit_sort(rec: &ObjectRecord) -> f64 {
     rec.transit_sort
 }
 
+/// Inventory status filter: which project/master state to keep.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum StatusFilter {
+    /// No status filter.
+    #[default]
+    Any,
+    /// A `.pxiproject` exists but `master/` holds no finished image — the
+    /// condition that paints a row yellow.
+    MissingMaster,
+    /// No `.pxiproject` anywhere in the object directory. Such rows are red
+    /// unless a finished image was dropped into `master/` by hand.
+    NoProject,
+}
+
+impl StatusFilter {
+    /// Parse the `status` query value. Unknown values fall back to "Any" so a
+    /// hand-edited URL cannot filter invisibly.
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("missing_master") => Self::MissingMaster,
+            Some("no_project") => Self::NoProject,
+            _ => Self::Any,
+        }
+    }
+
+    /// Query value for generated links; `None` for "Any status".
+    pub fn query_value(self) -> Option<&'static str> {
+        match self {
+            Self::Any => None,
+            Self::MissingMaster => Some("missing_master"),
+            Self::NoProject => Some("no_project"),
+        }
+    }
+
+    fn matches(self, rec: &ObjectRecord) -> bool {
+        match self {
+            Self::Any => true,
+            Self::MissingMaster => rec.has_project && !rec.has_final,
+            Self::NoProject => !rec.has_project,
+        }
+    }
+}
+
 /// Query-string suffix carrying the active inventory filters. Every generated
 /// link (sort headers, pager, page size, refresh) must include it, otherwise a
 /// click would silently drop the filter.
-pub fn filter_query_suffix(min_hours: Option<u32>, missing_master: bool) -> String {
+pub fn filter_query_suffix(
+    min_hours: Option<u32>,
+    telescope: Option<&str>,
+    status: StatusFilter,
+) -> String {
     let mut suffix = String::new();
     if let Some(hours) = min_hours {
         suffix.push_str(&format!("&min_hours={hours}"));
     }
-    if missing_master {
-        suffix.push_str("&missing_master=1");
+    if let Some(telescope) = telescope {
+        let encoded = percent_encode(telescope.as_bytes(), NON_ALPHANUMERIC);
+        suffix.push_str(&format!("&telescope={encoded}"));
+    }
+    if let Some(status) = status.query_value() {
+        suffix.push_str(&format!("&status={status}"));
     }
     suffix
 }
@@ -241,30 +296,36 @@ pub fn filter_query_suffix(min_hours: Option<u32>, missing_master: bool) -> Stri
 /// Does a record pass the index filters? Filters combine with AND.
 ///
 /// `min_hours` keeps directories whose total exposure is **strictly** above
-/// the threshold. `missing_master` keeps project directories with no image in
-/// `master/` — the same condition that paints a row yellow.
+/// the threshold. `telescope` keeps a single telescope directory.
+/// `status` keeps rows by project/master state.
 pub fn record_matches_filters(
     rec: &ObjectRecord,
     min_hours: Option<u32>,
-    missing_master: bool,
+    telescope: Option<&str>,
+    status: StatusFilter,
 ) -> bool {
     if let Some(hours) = min_hours {
         if crate::traverse::total_seconds(rec) <= hours as f64 * 3600.0 {
             return false;
         }
     }
-    if missing_master && !(rec.has_project && !rec.has_final) {
-        return false;
+    if let Some(telescope) = telescope {
+        if rec.telescope != telescope {
+            return false;
+        }
     }
-    true
+    status.matches(rec)
 }
 
 /// The filter form shown above the inventory table. A GET form keeps the
 /// filters bookmarkable and shareable, and the hidden inputs preserve the
 /// current sort and page size when the filters are applied.
+#[allow(clippy::too_many_arguments)]
 pub fn render_filter_bar(
     min_hours: Option<u32>,
-    missing_master: bool,
+    telescope: Option<&str>,
+    status: StatusFilter,
+    telescopes: &[String],
     sort_key: &str,
     direction: &str,
     page_size: usize,
@@ -287,8 +348,41 @@ pub fn render_filter_bar(
             )
         })
         .collect();
-    let any_status = if missing_master { "" } else { " selected" };
-    let missing_status = if missing_master { " selected" } else { "" };
+
+    // Same values as the "Add a new object" telescope dropdown: one entry per
+    // telescope directory found in the inventory.
+    let any_telescope = if telescope.is_none() { " selected" } else { "" };
+    let telescope_opts: Vec<String> = std::iter::once(format!(
+        "<option value=\"\"{any_telescope}>Any telescope</option>"
+    ))
+    .chain(telescopes.iter().map(|t| {
+        let selected = if telescope == Some(t.as_str()) { " selected" } else { "" };
+        format!(
+            "<option value=\"{}\"{}>{}</option>",
+            html_escape(t),
+            selected,
+            html_escape(t)
+        )
+    }))
+    .collect();
+
+    let status_options = [
+        (StatusFilter::Any, "Any status"),
+        (
+            StatusFilter::MissingMaster,
+            "Project present, master image missing",
+        ),
+        (StatusFilter::NoProject, "Project not present"),
+    ];
+    let status_opts: Vec<String> = status_options
+        .iter()
+        .map(|(value, label)| {
+            let selected = if *value == status { " selected" } else { "" };
+            let query = value.query_value().unwrap_or("");
+            format!("<option value=\"{query}\"{selected}>{label}</option>")
+        })
+        .collect();
+
     let clear_url = format!(
         "/?sort={sort_key}&dir={direction}&page=1&page_size={page_size}"
     );
@@ -300,16 +394,17 @@ pub fn render_filter_bar(
          <input type=\"hidden\" name=\"page_size\" value=\"{page_size}\">\
          <label for=\"min_hours\">Total exposure:</label>\
          <select name=\"min_hours\" id=\"min_hours\" title=\"Only directories with more total exposure than this\">{hour_opts}</select>\
-         <label for=\"missing_master\">Status:</label>\
-         <select name=\"missing_master\" id=\"missing_master\" title=\"Filter by project and master-image presence\">\
-         <option value=\"\"{any_status}>Any status</option>\
-         <option value=\"1\"{missing_status}>Project present, master image missing</option>\
-         </select>\
+         <label for=\"telescope_filter\">Telescope:</label>\
+         <select name=\"telescope\" id=\"telescope_filter\" title=\"Only directories belonging to this telescope\">{telescope_opts}</select>\
+         <label for=\"status\">Status:</label>\
+         <select name=\"status\" id=\"status\" title=\"Filter by project and master-image presence\">{status_opts}</select>\
          <button type=\"submit\" title=\"Apply the selected filters\">Apply filters</button>\
          <a class=\"clear\" href=\"{clear_url}\" title=\"Remove all filters\">Clear</a>\
          <span class=\"filters-summary\">Showing {shown} of {total} directories</span>\
          </form>",
         hour_opts = hour_opts.join(""),
+        telescope_opts = telescope_opts.join(""),
+        status_opts = status_opts.join(""),
         clear_url = html_escape(&clear_url),
     )
 }
@@ -621,6 +716,216 @@ pub fn render_edit_page(
 }
 
 // --- Generic review ---------------------------------------------------------
+
+// --- AstroBin submission ----------------------------------------------------
+
+/// The submission preview page. It shows the command the confirm POST runs, so
+/// what you see is what gets written (the same view as the skill's `--dry-run`),
+/// plus the engine preflight and the in-flight job status.
+pub fn render_submit_preview(
+    rec: &ObjectRecord,
+    title: &str,
+    argv: &[String],
+    pf: &Preflight,
+    submitted: Option<&Submitted>,
+    job: Option<&Job>,
+) -> String {
+    let master = crate::submit::master_file(rec);
+    let (file_disp, size_disp) = match &master {
+        Some(p) => {
+            let mb = std::fs::metadata(p).map(|m| m.len() as f64 / 1048576.0).unwrap_or(0.0);
+            (p.display().to_string(), format!("{mb:.1} MB"))
+        }
+        None => ("— no master JPEG in master/ —".to_string(), String::new()),
+    };
+    let setup = crate::submit::setup_by_telescope(&rec.telescope);
+    let setup_disp = match setup {
+        Some(s) => s.to_string(),
+        None => format!("(no AstroBin setup mapping for {} — setup will be skipped)", rec.telescope),
+    };
+
+    // Acquisition summary from the inventory scan: the skill rebuilds the exact
+    // per-date rows from the same directory when it runs.
+    let mut filter_rows = String::new();
+    let mut total_frames = 0u64;
+    let mut total_sec = 0.0f64;
+    for (flt, st) in &rec.filters {
+        total_frames += st.count;
+        total_sec += st.seconds;
+        filter_rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+            html_escape(flt),
+            st.count,
+            crate::traverse::fmt_total(Some(st.seconds))
+        ));
+    }
+
+    let preflight_rows = [
+        (format!("Chrome CDP port {}", crate::submit::CDP_PORT), pf.cdp_open, "the DevTools port the uploader connects to".to_string()),
+        ("node".to_string(), pf.node, "needed to run the uploader".to_string()),
+        ("puppeteer-core".to_string(), pf.puppeteer, "the CDP client".to_string()),
+        ("skill script".to_string(), pf.script, "the uploader engine".to_string()),
+        ("pi (LLM phrasing)".to_string(), pf.pi, "optional, only for --llm-description".to_string()),
+        ("Brave API key".to_string(), pf.brave_key, "optional, retrieval source".to_string()),
+    ]
+    .iter()
+    .map(|(name, ok, note)| {
+        format!(
+            "<tr><td>{}</td><td class=\"{}\">{}</td><td class=\"meta\">{}</td></tr>",
+            name,
+            if *ok { "ok" } else { "bad" },
+            if *ok { "ok" } else { "missing" },
+            note
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("");
+
+    let cmd = format!(
+        "NODE_PATH={} node {}",
+        html_escape(&format!(
+            "{}/{}",
+            std::env::var("HOME").unwrap_or_default(),
+            crate::submit::NODE_PATH_DIR
+        )),
+        argv.iter()
+            .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { html_escape(a) })
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    let submitted_line = submitted.map(|s| {
+        format!(
+            "Submitted: <a href=\"{}\">{}</a> (draft, {})",
+            html_escape(&s.url),
+            html_escape(&s.slug),
+            html_escape(&s.ts)
+        )
+    });
+
+    let job_line = job.map(|j| {
+        let (key, status, lines, done, ok, draft) = crate::submit::snapshot(j);
+        let lines_html = lines
+            .iter()
+            .rev()
+            .take(12)
+            .map(|l| format!("<div class=\"meta\">{}</div>", html_escape(l)))
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            "<b>{key} — {status}{run}{fail}</b><br>{lines}<br>{draft}",
+            key = html_escape(&key),
+            status = html_escape(&status),
+            run = if done { "" } else { " (running)" },
+            fail = if ok { "" } else { " — exit failed" },
+            lines = lines_html,
+            draft = draft
+                .map(|d| format!("<a href=\"{}\">draft</a>", html_escape(&d)))
+                .unwrap_or_default()
+        )
+    });
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AstroBin submission</title>
+<style>{css}</style>
+</head>
+<body>
+{navbar}
+<h1>AstroBin submission: {tel}/{name}</h1>
+<p class="meta">AstroBin's API is read-only, so this drives the web uploader
+through a logged-in Chrome. The draft is left unpublished; the Publish button is
+never pressed. One submission runs at a time.</p>
+{submitted}
+<h2>Will upload</h2>
+<table>
+<tr><th>File</th><td>{file} ({size})</td></tr>
+<tr><th>Title</th><td>{title_disp}</td></tr>
+<tr><th>AstroBin setup</th><td>{setup_disp}</td></tr>
+<tr><th>Acquisition</th><td>{frames} frames · {total} (rows built per date at upload time)</td></tr>
+</table>
+<h2>Filters in inventory</h2>
+<table><tr><th>Filter</th><th>Frames</th><th>Duration</th></tr>{filter_rows}</table>
+<h2>Engine preflight</h2>
+<table><tr><th>Component</th><th>State</th><th>Why</th></tr>{preflight_rows}</table>
+{cdp_warn}
+<h2>Command the confirm button runs</h2>
+<pre class="plan">{cmd}</pre>
+<h2>Confirm</h2>
+<form method="post" action="/submit">
+  <input type="hidden" name="telescope" value="{tel_esc}">
+  <input type="hidden" name="name" value="{name_esc}">
+  <label for="title">Title:</label>
+  <input type="text" id="title" name="title" value="{title_esc}">
+  <p>
+    <label><input type="checkbox" name="auto_description" value="true" checked> auto description (Brave/Wikipedia)</label>
+    <label><input type="checkbox" name="llm" value="true" checked> LLM phrasing (fact-guarded)</label>
+    <label><input type="checkbox" name="no_setup" value="true"> skip setup</label>
+    <label><input type="checkbox" name="no_acquisition" value="true"> skip acquisition</label>
+    <label><input type="checkbox" name="dry_run" value="true"> dry run (no upload)</label>
+  </p>
+  <input type="hidden" name="confirm" value="yes">
+  <button type="submit">Confirm submit</button>
+  <a href="/" class="cancel">Cancel</a>
+</form>
+<h2>Status</h2>
+<div id="jobstatus">{job_line}</div>
+<script>
+async function poll() {{
+  try {{
+    const r = await fetch('/submit/progress');
+    const j = await r.json();
+    const el = document.getElementById('jobstatus');
+    if (!j) {{ el.textContent = 'idle'; return; }}
+    el.textContent = j.key + ' — ' + j.status + (j.done ? '' : ' (running)');
+    for (const l of j.lines.slice(-12).reverse()) {{
+      const d = document.createElement('div');
+      d.className = 'meta';
+      d.textContent = l;
+      el.appendChild(d);
+    }}
+    if (j.draft) {{
+      const a = document.createElement('a');
+      a.href = j.draft; a.textContent = 'draft';
+      el.appendChild(document.createElement('br'));
+      el.appendChild(a);
+    }}
+  }} catch (e) {{ /* server restarted mid-poll */ }}
+}}
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>"#,
+        css = CSS,
+        navbar = render_navbar("inventory"),
+        tel = html_escape(&rec.telescope),
+        name = html_escape(&rec.object),
+        submitted = submitted_line.unwrap_or_default(),
+        file = html_escape(&file_disp),
+        size = size_disp,
+        title_disp = html_escape(title),
+        setup_disp = html_escape(&setup_disp),
+        frames = total_frames,
+        total = crate::traverse::fmt_total(Some(total_sec)),
+        filter_rows = filter_rows,
+        preflight_rows = preflight_rows,
+        cdp_warn = if pf.cdp_open { String::new() } else {
+            "<p class=\"meta\"><b>Chrome is not listening on CDP port 9222.</b> \
+             Run <code>~/.agents/skills/astrobin-upload/scripts/start-chrome.sh --kill</code>, \
+             log in, then retry. A dry run works without Chrome.</p>".to_string()
+        },
+        cmd = cmd,
+        tel_esc = html_escape(&rec.telescope),
+        name_esc = html_escape(&rec.object),
+        title_esc = html_escape(title),
+        job_line = job_line.unwrap_or_else(|| "idle".to_string()),
+    )
+}
+
 
 /// Landing page listing every directory, under any review root, that holds
 /// frames. Rows carry raw byte totals so sorting is numeric: ordering by the
@@ -1668,65 +1973,150 @@ mod tests {
         let over_10h_no_master = record_with_exposure(10.0 * 3600.0 + 1.0, true, false);
         let over_10h_with_master = record_with_exposure(10.0 * 3600.0 + 1.0, true, true);
 
-        assert!(!record_matches_filters(&no_exposure, Some(0), false), "0h exactly is not > 0h");
-        assert!(record_matches_filters(&exactly_1h, Some(0), false));
-        assert!(!record_matches_filters(&exactly_1h, Some(1), false), "1h exactly is not > 1h");
-        assert!(record_matches_filters(&over_1h, Some(1), false));
-        assert!(record_matches_filters(&over_10h_no_master, Some(10), false));
-        assert!(!record_matches_filters(&over_1h, Some(10), false));
+        let keep = |rec: &ObjectRecord, hours: Option<u32>, status: StatusFilter| {
+            record_matches_filters(rec, hours, None, status)
+        };
+        let any = StatusFilter::Any;
+
+        assert!(!keep(&no_exposure, Some(0), any), "0h exactly is not > 0h");
+        assert!(keep(&exactly_1h, Some(0), any));
+        assert!(!keep(&exactly_1h, Some(1), any), "1h exactly is not > 1h");
+        assert!(keep(&over_1h, Some(1), any));
+        assert!(keep(&over_10h_no_master, Some(10), any));
+        assert!(!keep(&over_1h, Some(10), any));
 
         // Missing master = project present, final image absent.
-        assert!(record_matches_filters(&over_10h_no_master, None, true));
-        assert!(!record_matches_filters(&over_10h_with_master, None, true));
-        assert!(!record_matches_filters(&over_1h, None, true), "no project");
-        assert!(record_matches_filters(&over_10h_no_master, Some(1), true));
+        let missing = StatusFilter::MissingMaster;
+        assert!(keep(&over_10h_no_master, None, missing));
+        assert!(!keep(&over_10h_with_master, None, missing));
+        assert!(!keep(&over_1h, None, missing), "no project");
+        assert!(keep(&over_10h_no_master, Some(1), missing));
         assert!(
-            !record_matches_filters(&over_1h, Some(10), true),
+            !keep(&over_1h, Some(10), missing),
             "filters must AND"
         );
+    }
+
+    /// The telescope dropdown narrows to one telescope directory, and the
+    /// status dropdown can select directories with no `.pxiproject` at all.
+    #[test]
+    fn telescope_and_status_filters_narrow_the_list() {
+        let mut rc = record_with_exposure(3600.0, true, false);
+        rc.telescope = "10RC".to_string();
+        let mut esprit = record_with_exposure(3600.0, false, false);
+        esprit.telescope = "Esprit100".to_string();
+        // A finished image without a .pxiproject is still "project not present".
+        let mut orphan = record_with_exposure(3600.0, false, true);
+        orphan.telescope = "8RC".to_string();
+
+        let any = StatusFilter::Any;
+        assert!(record_matches_filters(&rc, None, Some("10RC"), any));
+        assert!(!record_matches_filters(&esprit, None, Some("10RC"), any));
+        assert!(record_matches_filters(&esprit, None, Some("Esprit100"), any));
+
+        let no_project = StatusFilter::NoProject;
+        assert!(record_matches_filters(&esprit, None, None, no_project));
+        assert!(record_matches_filters(&orphan, None, None, no_project));
+        assert!(!record_matches_filters(&rc, None, None, no_project));
+
+        // Filters still combine with AND.
+        assert!(!record_matches_filters(
+            &esprit,
+            Some(1),
+            Some("10RC"),
+            no_project
+        ));
+        assert!(record_matches_filters(
+            &esprit,
+            Some(0),
+            Some("Esprit100"),
+            no_project
+        ));
     }
 
     /// The filter form must show the active selection, preserve sort/page
     /// size, and report how many directories survived the filter.
     #[test]
     fn filter_bar_shows_the_active_selection_and_the_filtered_count() {
-        let html = render_filter_bar(Some(10), true, "latest", "desc", 20, 7, 300);
+        let telescopes = vec!["10RC".to_string(), "Esprit100".to_string()];
+        let html = render_filter_bar(
+            Some(10),
+            Some("Esprit100"),
+            StatusFilter::NoProject,
+            &telescopes,
+            "latest",
+            "desc",
+            20,
+            7,
+            300,
+        );
         assert!(html.contains("<option value=\"10\" selected>More than 10 hours</option>"));
+        assert!(
+            html.contains("<option value=\"Esprit100\" selected>Esprit100</option>"),
+            "the selected telescope must be marked"
+        );
+        assert!(
+            html.contains("<option value=\"no_project\" selected>Project not present</option>"),
+            "the status dropdown needs a project-not-present option"
+        );
         assert!(html.contains(
-            "<option value=\"1\" selected>Project present, master image missing</option>"
+            "<option value=\"missing_master\">Project present, master image missing</option>"
         ));
         assert!(html.contains("Showing 7 of 300 directories"));
         assert!(html.contains("name=\"sort\" value=\"latest\""));
         assert!(html.contains("name=\"dir\" value=\"desc\""));
         assert!(html.contains("name=\"page_size\" value=\"20\""));
 
-        let plain = render_filter_bar(None, false, "latest", "desc", 20, 300, 300);
+        let plain = render_filter_bar(
+            None,
+            None,
+            StatusFilter::Any,
+            &telescopes,
+            "latest",
+            "desc",
+            20,
+            300,
+            300,
+        );
         assert!(plain.contains("<option value=\"\" selected>Any exposure</option>"));
+        assert!(plain.contains("<option value=\"\" selected>Any telescope</option>"));
         assert!(plain.contains("<option value=\"\" selected>Any status</option>"));
+        // The telescope filter offers exactly the telescopes the add form
+        // offers, plus the "Any telescope" entry.
+        assert!(plain.contains("<option value=\"10RC\">10RC</option>"));
+        assert!(plain.contains("<option value=\"Esprit100\">Esprit100</option>"));
     }
 
     /// Once a filter is active, sorting/paging/page-size/refresh links must
     /// carry it; otherwise a single click silently drops the filter.
     #[test]
     fn active_filters_survive_sort_pager_and_page_size_links() {
-        let q = filter_query_suffix(Some(10), true);
-        assert_eq!(q, "&min_hours=10&missing_master=1");
+        let q = filter_query_suffix(Some(10), Some("Esprit100"), StatusFilter::MissingMaster);
+        assert_eq!(q, "&min_hours=10&telescope=Esprit100&status=missing_master");
 
         let headers = render_header_cells("latest", "desc", 20, &q);
-        assert!(headers.contains("min_hours=10&missing_master=1"), "sort links lose filters");
+        assert!(
+            headers.contains("min_hours=10&telescope=Esprit100&status=missing_master"),
+            "sort links lose filters"
+        );
 
         let pager = render_pager(2, 3, 50, "latest", "desc", 20, &q);
         assert!(
-            pager.contains("page=3&page_size=20&min_hours=10&missing_master=1"),
+            pager.contains("page=3&page_size=20&min_hours=10&telescope=Esprit100&status=missing_master"),
             "pager links lose filters"
         );
 
         let size = page_size_control(20, "latest", "desc", &q);
         assert!(
-            size.contains("page=1&min_hours=10&missing_master=1&page_size="),
+            size.contains("page=1&min_hours=10&telescope=Esprit100&status=missing_master&page_size="),
             "page-size control loses filters"
         );
-        assert_eq!(filter_query_suffix(None, false), "");
+        assert_eq!(filter_query_suffix(None, None, StatusFilter::Any), "");
+        // A telescope name with a space stays a single, escaped query value.
+        assert_eq!(
+            filter_query_suffix(None, Some("Esprit 100"), StatusFilter::Any),
+            "&telescope=Esprit%20100"
+        );
     }
 
     /// Plans with a TODO section are pinned above the sorted rows, and the

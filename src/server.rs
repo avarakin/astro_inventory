@@ -18,10 +18,12 @@ use crate::plan::expand_constellation;
 use crate::render::{
     col_by_key, filter_query_suffix, page_size_control, record_matches_filters, render_edit_page,
     render_filter_bar, render_header_cells, render_index_page, render_pager, render_review,
-    render_review_index, sort_records,
+    render_review_index, sort_records, StatusFilter,
 };
 use crate::traverse::{build_row, traverse, ObjectRecord};
 use crate::review::{self, Manifest, PreviewCache, PreviewState};
+use crate::submit::{self, Job, JobState, Submitted, SubmitOptions};
+use std::collections::BTreeMap;
 use astro_inventory::compendium;
 
 /// Shared application state.
@@ -57,6 +59,16 @@ pub struct AppState {
     pub apply_progress: Mutex<Option<(usize, Arc<AtomicUsize>)>>,
     /// Serializes full FITS decodes: each one saturates rayon for ~250 ms.
     render_permits: Semaphore,
+    /// Preview cache directory (where `submitted.json` lives).
+    pub cache_dir: PathBuf,
+    /// In-flight AstroBin submission: `(telescope/object, job state)`. One slot
+    /// on purpose — AstroBin's chunked upload and the single logged-in Chrome
+    /// cannot be driven in parallel, so a second submit is refused while one
+    /// runs (same shape as `apply_progress`).
+    pub submit_job: Mutex<Option<Job>>,
+    /// Objects already submitted, keyed `telescope/object` -> draft. Loaded
+    /// from the cache dir at startup, appended when a job prints its draft URL.
+    pub submitted: Mutex<BTreeMap<String, Submitted>>,
 }
 
 struct ScanCache {
@@ -79,7 +91,7 @@ impl AppState {
         nav_repeat_ms: u64,
         tel_map: HashMap<String, String>,
     ) -> Arc<Self> {
-        let previews = Some(PreviewCache::new(cache_dir));
+        let previews = Some(PreviewCache::new(cache_dir.clone()));
         Arc::new(Self {
             root,
             page_size_default: page_size,
@@ -101,6 +113,9 @@ impl AppState {
             failed_keys: Mutex::new(HashSet::new()),
             apply_progress: Mutex::new(None),
             render_permits: Semaphore::new(1),
+            cache_dir: cache_dir.clone(),
+            submit_job: Mutex::new(None),
+            submitted: Mutex::new(submit::load_submitted(&cache_dir)),
         })
     }
 
@@ -288,6 +303,9 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/review/newdest", post(review_newdest))
         .route("/review/apply", post(review_apply))
         .route("/review/progress", get(review_progress))
+        .route("/submit/{telescope}/{name}", get(submit_preview_page))
+        .route("/submit", post(submit_start))
+        .route("/submit/progress", get(submit_progress))
         .with_state(state)
 }
 
@@ -304,7 +322,13 @@ struct IndexQuery {
     /// hours. Kept as a string because the filter form submits an empty value
     /// for "Any exposure", which would fail to deserialize into a number.
     min_hours: Option<String>,
-    /// Filter: `"1"` keeps only project directories with no master image.
+    /// Filter: only directories belonging to this telescope (a telescope
+    /// directory name, same values as the "Add a new object" dropdown).
+    telescope: Option<String>,
+    /// Filter: project/master state — `missing_master` or `no_project`.
+    status: Option<String>,
+    /// Legacy status parameter from before the dropdown had two values;
+    /// `missing_master=1` still means "Project present, master image missing".
     missing_master: Option<String>,
 }
 
@@ -316,17 +340,28 @@ fn flash_cookie(cat: &str, msg: &str) -> String {
 
 // --- Routes ---
 
-/// Parse the inventory filter query. Only the three offered thresholds are
-/// accepted: a hand-edited URL cannot leave the select showing "Any exposure"
-/// while the table is filtered by an invisible value.
+/// Parse the inventory filter query. Only the three offered exposure
+/// thresholds are accepted: a hand-edited URL cannot leave the select showing
+/// "Any exposure" while the table is filtered by an invisible value. The
+/// telescope name is validated against the known telescopes by the caller.
 fn parse_index_filters(
     min_hours: Option<&str>,
-    missing_master: Option<&str>,
-) -> (Option<u32>, bool) {
+    telescope: Option<&str>,
+    status: Option<&str>,
+    legacy_missing_master: Option<&str>,
+) -> (Option<u32>, Option<String>, StatusFilter) {
     let hours = min_hours
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|h| matches!(h, 0 | 1 | 10));
-    (hours, missing_master == Some("1"))
+    let telescope = telescope
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut status = StatusFilter::parse(status);
+    if status == StatusFilter::Any && legacy_missing_master == Some("1") {
+        status = StatusFilter::MissingMaster;
+    }
+    (hours, telescope, status)
 }
 
 async fn index(
@@ -344,10 +379,18 @@ async fn index(
         v
     };
 
-    let (min_hours, missing_master) =
-        parse_index_filters(params.min_hours.as_deref(), params.missing_master.as_deref());
+    let (min_hours, telescope, status) = parse_index_filters(
+        params.min_hours.as_deref(),
+        params.telescope.as_deref(),
+        params.status.as_deref(),
+        params.missing_master.as_deref(),
+    );
+    // A telescope that no longer exists must not filter invisibly.
+    let telescope = telescope.filter(|t| telescopes.iter().any(|known| known == t));
     let total_all = records.len();
-    records.retain(|rec| record_matches_filters(rec, min_hours, missing_master));
+    records.retain(|rec| {
+        record_matches_filters(rec, min_hours, telescope.as_deref(), status)
+    });
 
     // Sort
     let sort_key = params.sort.as_deref().unwrap_or("latest");
@@ -408,7 +451,32 @@ async fn index(
                 // read, bookmark, and debug than `dir=%2Fa%2F%2Fb`.
                 format!("/review?dir={}", percent_encode(s.as_bytes(), crate::render::DIR_QUERY))
             };
-            build_row(rec, &image_url_fn, &actions_url_fn, &review_url_fn)
+            // AstroBin submission page per object, and the recorded draft slug
+            // (if any) so a submitted row says so.
+            let submit_url_fn = |tel: &str, name: &str| -> String {
+                format!(
+                    "/submit/{}/{}",
+                    percent_encode(tel.as_bytes(), crate::render::DIR_QUERY),
+                    percent_encode(name.as_bytes(), crate::render::DIR_QUERY)
+                )
+            };
+            let submitted_slug_fn = |tel: &str, name: &str| -> Option<String> {
+                let key = format!("{tel}/{name}");
+                state
+                    .submitted
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .map(|s| s.slug.clone())
+            };
+            build_row(
+                rec,
+                &image_url_fn,
+                &actions_url_fn,
+                &review_url_fn,
+                &submit_url_fn,
+                &submitted_slug_fn,
+            )
         })
         .collect();
 
@@ -420,7 +488,7 @@ async fn index(
 
     // Keep the active filters on every generated link, so sorting, paging,
     // changing the page size, or refreshing does not silently widen the view.
-    let filter_query = filter_query_suffix(min_hours, missing_master);
+    let filter_query = filter_query_suffix(min_hours, telescope.as_deref(), status);
 
     let refresh_url = format!(
         "?sort={sort_key}&dir={direction}&page=1&page_size={page_size}{filter_query}&refresh=1"
@@ -428,7 +496,9 @@ async fn index(
 
     let filter_bar = render_filter_bar(
         min_hours,
-        missing_master,
+        telescope.as_deref(),
+        status,
+        &telescopes,
         sort_key,
         direction,
         page_size,
@@ -1534,6 +1604,301 @@ async fn review_apply(
     Ok(Json(report))
 }
 
+// --- AstroBin submission ----------------------------------------------------
+
+/// The confirm form. Checkboxes arrive as `true`/`false` from the preview page.
+/// The confirm form. An unchecked box is *omitted* by the browser, not sent as
+/// false, so every flag needs a serde default.
+#[derive(Deserialize)]
+struct SubmitForm {
+    telescope: String,
+    name: String,
+    title: String,
+    #[serde(default)]
+    auto_description: bool,
+    #[serde(default)]
+    llm: bool,
+    #[serde(default)]
+    no_setup: bool,
+    #[serde(default)]
+    no_acquisition: bool,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    confirm: String,
+}
+
+fn find_record(
+    state: &Arc<AppState>,
+    telescope: &str,
+    name: &str,
+) -> Result<ObjectRecord, (StatusCode, String)> {
+    let (records, _) = state.get_records(false);
+    records
+        .into_iter()
+        .find(|r| r.telescope == telescope && r.object == name)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("object {telescope}/{name} is not in the inventory"),
+        ))
+}
+
+/// The submission preview: file, title, setup, acquisition, description source,
+/// the exact command, and the engine preflight. It renders the same argv the
+/// confirm POST runs, so the page is the dry-run view.
+async fn submit_preview_page(
+    State(state): State<Arc<AppState>>,
+    Path((tel, name)): Path<(String, String)>,
+) -> Result<Html<String>, (StatusCode, String)> {
+    let rec = find_record(&state, &tel, &name)?;
+    let title = submit::default_title(&rec);
+    let opts = SubmitOptions {
+        auto_description: true,
+        llm: true,
+        ..Default::default()
+    };
+    let argv = submit::build_argv(&rec, &opts, &title);
+    let pf = tokio::task::spawn_blocking(move || submit::preflight(submit::CDP_PORT))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let key = format!("{tel}/{name}");
+    let submitted = state
+        .submitted
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned();
+    let job = state.submit_job.lock().unwrap().clone();
+    Ok(Html(crate::render::render_submit_preview(
+        &rec,
+        &title,
+        &argv,
+        &pf,
+        submitted.as_ref(),
+        job.as_ref(),
+    )))
+}
+
+/// Confirm: build the argv, check the engine, spawn the skill as one serialized
+/// background job, and redirect back to the preview page (which polls progress).
+async fn submit_start(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<SubmitForm>,
+) -> Result<Response, (StatusCode, String)> {
+    if form.confirm != "yes" {
+        return Err((StatusCode::BAD_REQUEST, "submission not confirmed".to_string()));
+    }
+    let rec = find_record(&state, &form.telescope, &form.name)?;
+    let master = submit::master_file(&rec).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("no master JPEG in {}/master", rec.path.display()),
+    ))?;
+    if !master.is_file() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("master file does not exist: {}", master.display()),
+        ));
+    }
+    let opts = SubmitOptions {
+        auto_description: form.auto_description,
+        llm: form.llm,
+        dry_run: form.dry_run,
+        no_setup: form.no_setup,
+        no_acquisition: form.no_acquisition,
+    };
+    let argv = submit::build_argv(&rec, &opts, &form.title);
+    let key = format!("{}/{}", form.telescope, form.name);
+
+    // One driver at a time: the skill drives a single logged-in Chrome and
+    // AstroBin uploads in chunks, so a second submit while one runs is refused.
+    let busy = state
+        .submit_job
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(_, st)| !st.lock().unwrap().done)
+        .unwrap_or(false);
+    if busy {
+        return Err((
+            StatusCode::CONFLICT,
+            "a submission is already running — AstroBin and the logged-in Chrome \
+             can only be driven by one job at a time"
+                .to_string(),
+        ));
+    }
+
+    let pf = submit::preflight(submit::CDP_PORT);
+    if !pf.script {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("skill script missing: {}", submit::home_dir().join(submit::SKILL_SCRIPT).display()),
+        ));
+    }
+    if !pf.node {
+        return Err((StatusCode::BAD_REQUEST, "node is not on PATH".to_string()));
+    }
+    if !pf.puppeteer {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("puppeteer-core missing: {}", submit::home_dir().join(submit::NODE_PATH_DIR).display()),
+        ));
+    }
+    // A dry run needs no browser; a real submit does.
+    if !pf.cdp_open && !opts.dry_run {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Chrome is not listening on CDP port {} — run {} --kill, log in, then retry",
+                submit::CDP_PORT,
+                "/home/alex/.agents/skills/astrobin-upload/scripts/start-chrome.sh"
+            ),
+        ));
+    }
+
+    spawn_submit(state.clone(), key, argv);
+    let uri = format!(
+        "/submit/{}/{}",
+        percent_encode(form.telescope.as_bytes(), crate::render::DIR_QUERY),
+        percent_encode(form.name.as_bytes(), crate::render::DIR_QUERY)
+    );
+    Ok(axum::response::Redirect::to(&uri).into_response())
+}
+
+/// Spawns `node …/upload.js …` and streams milestones into the shared job slot.
+pub fn spawn_submit(state: Arc<AppState>, key: String, argv: Vec<String>) {
+    let shared = JobState::new("running");
+    *state.submit_job.lock().unwrap() = Some((key.clone(), shared.clone()));
+    let state2 = state.clone();
+    let key2 = key.clone();
+    tokio::spawn(async move {
+        use std::process::Stdio;
+        use tokio::io::BufReader;
+        use tokio::process::Command;
+        let node = submit::node_path().unwrap_or_else(|| "node".to_string());
+        let mut cmd = Command::new(node);
+        cmd.args(&argv)
+            .env("NODE_PATH", submit::home_dir().join(submit::NODE_PATH_DIR))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let mut st = shared.lock().unwrap();
+                st.status = format!("spawn failed: {e}");
+                st.done = true;
+                return;
+            }
+        };
+        // Milestones go to stdout, warnings to stderr; both are drained so the
+        // pipes never block the child.
+        let out = child.stdout.take();
+        let err = child.stderr.take();
+        let s1 = shared.clone();
+        let s2 = shared.clone();
+        let t1 = tokio::spawn(async move {
+            if let Some(o) = out {
+                drain_lines(BufReader::new(o), s1).await;
+            }
+        });
+        let t2 = tokio::spawn(async move {
+            if let Some(e) = err {
+                drain_lines(BufReader::new(e), s2).await;
+            }
+        });
+        let status = child.wait().await;
+        t1.await.ok();
+        t2.await.ok();
+        let code = status.as_ref().map(|s| s.code());
+        {
+            let mut st = shared.lock().unwrap();
+            st.done = true;
+            st.ok = status.as_ref().map(|s| s.success()).unwrap_or(false);
+            let base = if st.ok {
+                "completed".to_string()
+            } else {
+                format!(
+                    "upload failed (exit {:?}): {}",
+                    code,
+                    st.lines.last().cloned().unwrap_or_default()
+                )
+            };
+            // The LLM guard rejecting a draft is the failure mode a user needs
+            // to see; the deterministic scrape path still produced a description.
+            let llm_note = if st.lines.iter().any(|l| l.contains("llm description rejected")) {
+                " — llm rejected, deterministic fallback used"
+            } else {
+                ""
+            };
+            st.status = format!("{base}{llm_note}");
+        }
+        // Record the draft so the row shows it and a double-submit is visible.
+        let draft = shared.lock().unwrap().draft_url.clone();
+        if let Some(url) = draft {
+            let rec = Submitted {
+                slug: submit::slug_from_url(&url),
+                url,
+                file: argv.get(1).cloned().unwrap_or_default(),
+                title: argv.get(2).cloned().unwrap_or_default(),
+                ts: Local::now().to_rfc3339(),
+            };
+            {
+                let mut m = state2.submitted.lock().unwrap();
+                m.insert(key2.clone(), rec.clone());
+            }
+            let _ = submit::record_submitted(&state2.cache_dir, &key2, rec);        }
+    });
+}
+
+async fn drain_lines<R>(mut reader: tokio::io::BufReader<R>, shared: Arc<Mutex<JobState>>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    use tokio::io::AsyncBufReadExt;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let t = line.trim().to_string();
+                if t.is_empty() {
+                    continue;
+                }
+                let mut st = shared.lock().unwrap();
+                // Keep every line, capped: the failure reason (`ERROR: …`,
+                // `Page errors: …`) is not a milestone, and a panel that shows
+                // only milestones reports "exit 1" with no cause.
+                st.lines.push(t);
+                if st.lines.len() > 200 {
+                    st.lines.remove(0);
+                }
+                if let Some(u) = submit::draft_url_from(st.lines.last().unwrap()) {
+                    st.draft_url = Some(u);
+                }
+            }
+        }
+    }
+}
+
+/// The in-flight/last submission, for the page's status panel.
+async fn submit_progress(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let slot = state.submit_job.lock().unwrap().clone();
+    match slot {
+        Some((key, shared)) => {
+            let st = shared.lock().unwrap();
+            Json(serde_json::json!({
+                "key": key,
+                "status": st.status,
+                "lines": st.lines,
+                "done": st.done,
+                "ok": st.ok,
+                "draft": st.draft_url,
+            }))
+        }
+        None => Json(serde_json::Value::Null),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1542,13 +1907,46 @@ mod tests {
     /// thresholds the UI does not offer.
     #[test]
     fn index_filters_accept_only_the_offered_values() {
-        assert_eq!(parse_index_filters(Some("0"), None), (Some(0), false));
-        assert_eq!(parse_index_filters(Some("1"), Some("1")), (Some(1), true));
-        assert_eq!(parse_index_filters(Some("10"), Some("")), (Some(10), false));
-        assert_eq!(parse_index_filters(Some(""), Some("0")), (None, false));
-        assert_eq!(parse_index_filters(Some("5"), None), (None, false));
-        assert_eq!(parse_index_filters(Some("abc"), None), (None, false));
-        assert_eq!(parse_index_filters(None, None), (None, false));
+        let any = StatusFilter::Any;
+        assert_eq!(
+            parse_index_filters(Some("0"), None, None, None),
+            (Some(0), None, any)
+        );
+        assert_eq!(
+            parse_index_filters(Some("1"), Some("Esprit100"), Some("missing_master"), None),
+            (
+                Some(1),
+                Some("Esprit100".to_string()),
+                StatusFilter::MissingMaster
+            )
+        );
+        assert_eq!(
+            parse_index_filters(Some("10"), None, Some("no_project"), Some("")),
+            (Some(10), None, StatusFilter::NoProject)
+        );
+        // An empty telescope is "Any telescope", not a filter on "".
+        assert_eq!(
+            parse_index_filters(None, Some("   "), Some(""), None),
+            (None, None, any)
+        );
+        // Old bookmarks used `missing_master=1`; they keep working.
+        assert_eq!(
+            parse_index_filters(None, None, None, Some("1")),
+            (None, None, StatusFilter::MissingMaster)
+        );
+        // ...but an explicit status value wins over the legacy parameter.
+        assert_eq!(
+            parse_index_filters(None, None, Some("no_project"), Some("1")),
+            (None, None, StatusFilter::NoProject)
+        );
+        assert_eq!(
+            parse_index_filters(Some("5"), None, Some("bogus"), None),
+            (None, None, any)
+        );
+        assert_eq!(
+            parse_index_filters(None, None, None, None),
+            (None, None, any)
+        );
     }
 
     /// AstroBin encodes coordinates as decimal-degree *strings* (`"ra":

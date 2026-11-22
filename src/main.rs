@@ -5,10 +5,12 @@ mod plan;
 mod server;
 mod render;
 mod review;
+mod submit;
 
 use std::path::PathBuf;
 
 use clap::Parser;
+use clap::Subcommand;
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -65,6 +67,36 @@ struct Cli {
     /// TCP port to bind
     #[arg(long, default_value_t = 5000)]
     port: u16,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Submit an inventory object to AstroBin (unlisted draft, never published)
+    Submit {
+        /// Object as `telescope/name`, e.g. `10RC/Bubble`
+        target: String,
+        /// Title override (default: derived from the object directory name)
+        #[arg(long)]
+        title: Option<String>,
+        /// LLM phrasing layer over the scraped sources (fact-guarded)
+        #[arg(long)]
+        llm: bool,
+        /// Skip the auto description
+        #[arg(long)]
+        no_auto: bool,
+        /// Skip the AstroBin setup assignment
+        #[arg(long)]
+        no_setup: bool,
+        /// Skip the acquisition CSV
+        #[arg(long)]
+        no_acquisition: bool,
+        /// Show what would be uploaded; no browser, no upload
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Deserialize, Default)]
@@ -121,6 +153,89 @@ fn config_path_in(
     Ok(fallback.is_file().then_some(fallback))
 }
 
+/// CLI path for `astro_inventory submit telescope/name …`: shares the argv
+/// builder with the web route, so the CLI and the page produce one command.
+fn run_submit(
+    root: &std::path::Path,
+    cache_dir: &std::path::Path,
+    target: &str,
+    title: Option<&str>,
+    llm: bool,
+    no_auto: bool,
+    no_setup: bool,
+    no_acquisition: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let (tel, name) = target
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("target must be telescope/name, e.g. 10RC/Bubble"))?;
+    let rec = traverse::traverse(root, 0.0)
+        .into_iter()
+        .find(|r| r.telescope == tel && r.object == name)
+        .ok_or_else(|| anyhow::anyhow!("{tel}/{name} is not in the inventory"))?;
+    let opts = submit::SubmitOptions {
+        auto_description: !no_auto,
+        llm,
+        dry_run,
+        no_setup,
+        no_acquisition,
+    };
+    let derived = submit::default_title(&rec);
+    let title = title.unwrap_or(&derived);
+    let argv = submit::build_argv(&rec, &opts, title);
+    if submit::master_file(&rec).is_none() {
+        anyhow::bail!("no master JPEG in {}/master", rec.path.display());
+    }
+    let pf = submit::preflight(submit::CDP_PORT);
+    eprintln!(
+        "preflight: node={} puppeteer={} script={} cdp={} pi={} brave={}",
+        pf.node, pf.puppeteer, pf.script, pf.cdp_open, pf.pi, pf.brave_key
+    );
+    if !pf.script {
+        anyhow::bail!("skill script missing: {}", submit::home_dir().join(submit::SKILL_SCRIPT).display());
+    }
+    if !pf.node {
+        anyhow::bail!("node is not on PATH");
+    }
+    if !dry_run && !pf.cdp_open {
+        eprintln!(
+            "Chrome is not listening on CDP port {}; run ~/.agents/skills/astrobin-upload/scripts/start-chrome.sh --kill, log in, then retry",
+            submit::CDP_PORT
+        );
+        anyhow::bail!("no CDP port");
+    }
+    let home = submit::home_dir();
+    let node = submit::node_path().ok_or_else(|| anyhow::anyhow!("node is not on PATH"))?;
+    let out = std::process::Command::new(node)
+        .args(&argv)
+        .env("NODE_PATH", home.join(submit::NODE_PATH_DIR))
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    print!("{stdout}");
+    eprintln!("node exited: {:?}", out.status.code());
+    if !out.status.success() {
+        anyhow::bail!("upload failed (exit {:?})", out.status.code());
+    }
+    if !dry_run {
+        let url = stdout
+            .lines()
+            .filter_map(submit::draft_url_from)
+            .last()
+            .unwrap_or_default();
+        let slug = url.rsplit('/').next().unwrap_or("").to_owned();
+        let rec = submit::Submitted {
+            slug,
+            url,
+            file: submit::master_file(&rec).map(|p| p.display().to_string()).unwrap_or_default(),
+            title: title.to_owned(),
+            ts: chrono::Utc::now().to_rfc3339(),
+        };
+        let _ = submit::record_submitted(cache_dir, target, rec);
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -134,8 +249,30 @@ fn main() -> anyhow::Result<()> {
     };
 
     let root = pick(cli.root, cfg.root, PathBuf::from("/data/Astro/CCD"));
-    let staging = cli.staging.or(cfg.staging);
     let cache_dir = pick(cli.cache, cfg.cache, default_cache_dir());
+    if let Some(Command::Submit {
+        target,
+        title,
+        llm,
+        no_auto,
+        no_setup,
+        no_acquisition,
+        dry_run,
+    }) = &cli.command
+    {
+        return run_submit(
+            &root,
+            &cache_dir,
+            target,
+            title.as_deref(),
+            *llm,
+            *no_auto,
+            *no_setup,
+            *no_acquisition,
+            *dry_run,
+        );
+    }
+    let staging = cli.staging.or(cfg.staging);
     let page_size = pick(cli.page_size, cfg.page_size, 20);
     let compendium_dir = pick(cli.compendium_dir, cfg.compendium_dir, PathBuf::from("data/compendium"));
     // 500 ms is the default: a held arrow scrolls at two frames per second,
