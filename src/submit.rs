@@ -213,21 +213,6 @@ pub fn snapshot(job: &Job) -> (String, String, Vec<String>, bool, bool, Option<S
     (job.0.clone(), st.status.clone(), st.lines.clone(), st.done, st.ok, st.draft_url.clone())
 }
 
-/// A line worth surfacing in the progress panel: the script prints its own
-/// milestones, so a substring test is enough and keeps the panel short.
-pub fn is_milestone(line: &str) -> bool {
-    line.contains("UPLOAD COMPLETE")
-        || line.contains("Description path:")
-        || line.contains("Saved draft:")
-        || line.contains("In staging area")
-        || line.contains("llm description rejected")
-        || line.contains("llm call failed")
-        || line.contains("Publish button present")
-        || line.contains("Acquisition:")
-        || line.contains("AstroBin setup:")
-        || line.contains("Page errors:")
-        || line.contains("warning:")
-}
 
 pub fn draft_url_from(line: &str) -> Option<String> {
     line.split_once("Saved draft:").map(|(_, rest)| rest.trim().to_string())
@@ -237,11 +222,33 @@ pub fn draft_url_from(line: &str) -> Option<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Submitted {
+    #[serde(default)]
     pub slug: String,
+    #[serde(default)]
     pub url: String,
+    #[serde(default)]
     pub file: String,
+    #[serde(default)]
     pub title: String,
+    /// RFC3339 or epoch timestamp. Accepts a JSON string *or* number so a
+    /// hand-edited registry never fails to parse (which would silently drop
+    /// every entry).
+    #[serde(default, deserialize_with = "de_loose_string")]
     pub ts: String,
+}
+
+fn de_loose_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        other => return Err(D::Error::custom(format!("expected string or number, got {other}"))),
+    })
 }
 
 pub fn submitted_path(cache_dir: &Path) -> PathBuf {
@@ -354,10 +361,25 @@ mod tests {
     #[test]
     fn milestones_and_slug_are_extracted() {
         let line = "Saved draft: https://app.astrobin.com/i/pvc55t";
-        assert!(is_milestone(line));
         assert_eq!(draft_url_from(line), Some("https://app.astrobin.com/i/pvc55t".to_string()));
         assert_eq!(slug_from_url("https://app.astrobin.com/i/pvc55t/"), "pvc55t");
-        assert!(!is_milestone("chunk 312 sent"));
+    }
+
+    #[test]
+    fn registry_tolerates_missing_and_numeric_fields() {
+        let dir = std::env::temp_dir().join(format!("astro_submit_loose_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            submitted_path(&dir),
+            r#"{"10RC/Bubble":{"slug":"yerut6","url":"https://app.astrobin.com/i/yerut6","ts":1795380437}}"#,
+        )
+        .unwrap();
+        let map = load_submitted(&dir);
+        let s = map.get("10RC/Bubble").expect("entry should load");
+        assert_eq!(s.slug, "yerut6");
+        assert_eq!(s.ts, "1795380437");
+        assert_eq!(s.title, "");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
