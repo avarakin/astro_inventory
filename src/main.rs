@@ -191,8 +191,8 @@ fn run_submit(
     }
     let pf = submit::preflight(submit::CDP_PORT);
     eprintln!(
-        "preflight: node={} puppeteer={} script={} cdp={} pi={} brave={}",
-        pf.node, pf.puppeteer, pf.script, pf.cdp_open, pf.pi, pf.brave_key
+        "preflight: node={} puppeteer={} script={} cdp={} chrome={} pi={} brave={}",
+        pf.node, pf.puppeteer, pf.script, pf.cdp_open, pf.chrome_running, pf.pi, pf.brave_key
     );
     if !pf.script {
         anyhow::bail!("skill script missing: {}", submit::home_dir().join(submit::SKILL_SCRIPT).display());
@@ -200,12 +200,29 @@ fn run_submit(
     if !pf.node {
         anyhow::bail!("node is not on PATH");
     }
-    if !dry_run && !pf.cdp_open {
-        eprintln!(
-            "Chrome is not listening on CDP port {}; run ~/.agents/skills/astrobin-upload/scripts/start-chrome.sh --kill, log in, then retry",
-            submit::CDP_PORT
-        );
-        anyhow::bail!("no CDP port");
+    if !dry_run {
+        // Same auto-launch the web path does, so the CLI works after a reboot
+        // without a separate Chrome ritual. Killing a Chrome that is already
+        // open stays a human decision: the script's --kill is not used here.
+        let (outcome, lines) = submit::ensure_chrome(submit::CDP_PORT, false);
+        for l in &lines {
+            println!("[chrome] {l}");
+        }
+        match outcome {
+            submit::ChromeOutcome::AlreadyUp | submit::ChromeOutcome::Launched => {}
+            submit::ChromeOutcome::NeedsKill => {
+                anyhow::bail!(
+                    "Chrome is running without the DevTools port; close it (or run \
+                     ~/.agents/skills/astrobin-upload/scripts/start-chrome.sh --kill) and retry"
+                );
+            }
+            submit::ChromeOutcome::Failed => {
+                anyhow::bail!(
+                    "could not start Chrome: {}",
+                    lines.last().cloned().unwrap_or_else(|| "no output".to_string())
+                );
+            }
+        }
     }
     let home = submit::home_dir();
     let node = submit::node_path().ok_or_else(|| anyhow::anyhow!("node is not on PATH"))?;

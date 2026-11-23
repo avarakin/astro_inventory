@@ -140,6 +140,9 @@ pub struct Preflight {
     pub puppeteer: bool,
     pub script: bool,
     pub cdp_open: bool,
+    /// A Chrome process exists but may have no DevTools port; that changes what
+    /// launching it would cost the user.
+    pub chrome_running: bool,
     pub pi: bool,
     pub brave_key: bool,
 }
@@ -177,8 +180,134 @@ pub fn preflight(port: u16) -> Preflight {
         puppeteer: home_dir().join(NODE_PATH_DIR).join("puppeteer-core").is_dir(),
         script: home_dir().join(SKILL_SCRIPT).is_file(),
         cdp_open: cdp_open(port),
+        chrome_running: chrome_running(),
         pi: lookup("pi").is_some(),
         brave_key: std::env::var("BRAVE_API_KEY").is_ok(),
+    }
+}
+
+// --- Chrome launcher ---------------------------------------------------------
+
+/// Skill script that starts a visible, logged-in Chrome with the DevTools port
+/// on a copy of the real profile. Reused rather than reimplemented: it encodes
+/// the profile-copy exclusions and the anti-throttling flags the uploader needs
+/// on this Wayland session.
+pub const CHROME_SCRIPT: &str = ".agents/skills/astrobin-upload/scripts/start-chrome.sh";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeOutcome {
+    AlreadyUp,
+    Launched,
+    /// Chrome is running without the debug port, so the launcher would have to
+    /// close the user's windows. That is a human decision, not a default.
+    NeedsKill,
+    Failed,
+}
+
+pub fn chrome_running() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", "chrome"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Make sure a CDP-enabled Chrome is listening, starting one when needed.
+///
+/// Blocks while the script runs: first use copies the browser profile (about a
+/// minute), after that Chrome answers the port in a few seconds. Callers on an
+/// async runtime must wrap this in `spawn_blocking`. Returns the script's own
+/// log lines so the reason for a failure reaches the page.
+pub fn ensure_chrome(port: u16, allow_kill: bool) -> (ChromeOutcome, Vec<String>) {
+    if cdp_open(port) {
+        return (
+            ChromeOutcome::AlreadyUp,
+            vec![format!("CDP already listening on 127.0.0.1:{port}")],
+        );
+    }
+    let script = home_dir().join(CHROME_SCRIPT);
+    if !script.is_file() {
+        return (
+            ChromeOutcome::Failed,
+            vec![format!("launcher script missing: {}", script.display())],
+        );
+    }
+    if chrome_running() && !allow_kill {
+        return (
+            ChromeOutcome::NeedsKill,
+            vec![
+                "Chrome is already running without the DevTools port; a second instance cannot \
+                 share the profile, so starting one means closing the running windows".to_string(),
+            ],
+        );
+    }
+    let log = std::env::temp_dir().join("astro_inventory_chrome_launch.log");
+    let out_file = match fs::File::create(&log) {
+        Ok(f) => f,
+        Err(e) => return (ChromeOutcome::Failed, vec![format!("cannot write {}: {e}", log.display())]),
+    };
+    let err_file = match out_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => return (ChromeOutcome::Failed, vec![format!("cannot write {}: {e}", log.display())]),
+    };
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(out_file)
+        .stderr(err_file);
+    if allow_kill {
+        cmd.arg("--kill");
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (ChromeOutcome::Failed, vec![format!("cannot run {}: {e}", script.display())]);
+        }
+    };
+    // 240 s covers a first-run profile copy; the script disowns Chrome, so the
+    // browser outlives this helper either way.
+    let started = std::time::Instant::now();
+    let deadline = Duration::from_secs(240);
+    let mut timed_out = false;
+    // The exit status is not the verdict: the launcher can exit non-zero while
+    // Chrome comes up fine, so the port probe decides.
+    let _status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {
+                if started.elapsed() > deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            Err(_) => {
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let mut lines: Vec<String> = fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if cdp_open(port) {
+        (ChromeOutcome::Launched, lines)
+    } else {
+        if timed_out {
+            lines.push(format!("launcher still running after {}s", deadline.as_secs()));
+        }
+        if lines.is_empty() {
+            lines.push("launcher produced no output".to_string());
+        }
+        (ChromeOutcome::Failed, lines)
     }
 }
 
@@ -441,6 +570,17 @@ mod tests {
         let map = load_submitted(&dir);
         assert_eq!(map.get("10RC/Bubble").unwrap().slug, "pvc55t");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_chrome_reuses_a_listening_cdp_port() {
+        // Bind a throwaway port so `cdp_open` is true without touching Chrome:
+        // the launcher must probe first and never start a second browser.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (outcome, lines) = ensure_chrome(port, false);
+        assert_eq!(outcome, ChromeOutcome::AlreadyUp);
+        assert!(lines.iter().any(|l| l.contains("already listening")));
     }
 
     #[test]

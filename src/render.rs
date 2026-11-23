@@ -729,6 +729,7 @@ pub fn render_submit_preview(
     pf: &Preflight,
     submitted: Option<&Submitted>,
     job: Option<&Job>,
+    chrome_note: Option<String>,
 ) -> String {
     let master = crate::submit::master_file(rec);
     let (file_disp, size_disp) = match &master {
@@ -762,6 +763,16 @@ pub fn render_submit_preview(
 
     let preflight_rows = [
         (format!("Chrome CDP port {}", crate::submit::CDP_PORT), pf.cdp_open, "the DevTools port the uploader connects to".to_string()),
+        (
+            "Chrome process".to_string(),
+            pf.chrome_running,
+            if pf.chrome_running {
+                "running; without the debug port it must be closed before a CDP Chrome can start"
+            } else {
+                "not running; the launcher starts one with the login profile"
+            }
+            .to_string(),
+        ),
         ("node".to_string(), pf.node, "needed to run the uploader".to_string()),
         ("puppeteer-core".to_string(), pf.puppeteer, "the CDP client".to_string()),
         ("skill script".to_string(), pf.script, "the uploader engine".to_string()),
@@ -780,6 +791,44 @@ pub fn render_submit_preview(
     })
     .collect::<Vec<_>>()
     .join("");
+
+    // Chrome actions: launching it is a side effect the user can trigger from
+    // the page, so it gets its own buttons rather than a shell-command hint.
+    let chrome_block = if pf.cdp_open {
+        match chrome_note {
+            Some(n) => format!("<p class=\"meta\">{n}</p>"),
+            None => String::new(),
+        }
+    } else {
+        let note = chrome_note
+            .map(|n| format!("<p class=\"meta\"><b>{n}</b></p>"))
+            .unwrap_or_default();
+        let launch = format!(
+            "<form method=\"post\" action=\"/submit/chrome\" class=\"inline\"><input type=\"hidden\" name=\"telescope\" value=\"{t}\"><input type=\"hidden\" name=\"name\" value=\"{nm}\"><button type=\"submit\">Launch Chrome</button></form>",
+            t = html_escape(&rec.telescope),
+            nm = html_escape(&rec.object)
+        );
+        let restart = if pf.chrome_running {
+            format!(
+                "<form method=\"post\" action=\"/submit/chrome\" class=\"inline\"><input type=\"hidden\" name=\"telescope\" value=\"{t}\"><input type=\"hidden\" name=\"name\" value=\"{nm}\"><input type=\"hidden\" name=\"kill\" value=\"yes\"><button type=\"submit\">Restart Chrome with the debug port</button></form>",
+                t = html_escape(&rec.telescope),
+                nm = html_escape(&rec.object)
+            )
+        } else {
+            String::new()
+        };
+        let hint = if pf.chrome_running {
+            "A Chrome is running without the DevTools port, so the restart button closes its \
+             windows (tabs come back on the next normal start) — that is why it is a separate button."
+        } else {
+            "No Chrome is running: the button starts one on the copied login profile, then you can \
+             confirm below. A dry run needs no Chrome at all."
+        };
+        format!(
+            "{note}<p class=\"meta\"><b>Chrome is not listening on CDP port {}.</b> {hint}</p><p>{launch}{restart}</p>",
+            crate::submit::CDP_PORT
+        )
+    };
 
     let cmd = format!(
         "NODE_PATH={} node {}",
@@ -851,7 +900,7 @@ never pressed. One submission runs at a time.</p>
 <table><tr><th>Filter</th><th>Frames</th><th>Duration</th></tr>{filter_rows}</table>
 <h2>Engine preflight</h2>
 <table><tr><th>Component</th><th>State</th><th>Why</th></tr>{preflight_rows}</table>
-{cdp_warn}
+{chrome_block}
 <h2>Command the confirm button runs</h2>
 <pre class="plan">{cmd}</pre>
 <h2>Confirm</h2>
@@ -913,11 +962,7 @@ setInterval(poll, 2000);
         total = crate::traverse::fmt_total(Some(total_sec)),
         filter_rows = filter_rows,
         preflight_rows = preflight_rows,
-        cdp_warn = if pf.cdp_open { String::new() } else {
-            "<p class=\"meta\"><b>Chrome is not listening on CDP port 9222.</b> \
-             Run <code>~/.agents/skills/astrobin-upload/scripts/start-chrome.sh --kill</code>, \
-             log in, then retry. A dry run works without Chrome.</p>".to_string()
-        },
+        chrome_block = chrome_block,
         cmd = cmd,
         tel_esc = html_escape(&rec.telescope),
         name_esc = html_escape(&rec.object),

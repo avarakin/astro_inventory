@@ -305,6 +305,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/review/progress", get(review_progress))
         .route("/submit/{telescope}/{name}", get(submit_preview_page))
         .route("/submit", post(submit_start))
+        .route("/submit/chrome", post(submit_chrome))
         .route("/submit/progress", get(submit_progress))
         .with_state(state)
 }
@@ -1649,6 +1650,7 @@ fn find_record(
 async fn submit_preview_page(
     State(state): State<Arc<AppState>>,
     Path((tel, name)): Path<(String, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Html<String>, (StatusCode, String)> {
     let rec = find_record(&state, &tel, &name)?;
     let title = submit::default_title(&rec);
@@ -1669,6 +1671,23 @@ async fn submit_preview_page(
         .get(&key)
         .cloned();
     let job = state.submit_job.lock().unwrap().clone();
+    // The launch button posts elsewhere and redirects back here, so the outcome
+    // travels as a query tag: the page then shows the current preflight.
+    let chrome_note = match params.get("chrome").map(|s| s.as_str()) {
+        Some("launched") => Some(format!(
+            "Chrome started; CDP port {} is up.",
+            submit::CDP_PORT
+        )),
+        Some("failed") => Some(format!(
+            "Chrome launch failed — the CDP port {} is still closed. Check the launcher log.",
+            submit::CDP_PORT
+        )),
+        Some("needs_kill") => Some(
+            "Chrome is running without the debug port; use Restart Chrome with the debug port."
+                .to_string(),
+        ),
+        _ => None,
+    };
     Ok(Html(crate::render::render_submit_preview(
         &rec,
         &title,
@@ -1676,6 +1695,7 @@ async fn submit_preview_page(
         &pf,
         submitted.as_ref(),
         job.as_ref(),
+        chrome_note,
     )))
 }
 
@@ -1765,6 +1785,78 @@ async fn submit_start(
 }
 
 /// Spawns `node …/upload.js …` and streams milestones into the shared job slot.
+/// Start a CDP-enabled Chrome on demand. The uploader needs a logged-in Chrome
+/// with the DevTools port; rather than telling the user to open a terminal, the
+/// preview page posts here. `kill=yes` is the deliberate variant that closes a
+/// Chrome running without the port — never the default.
+#[derive(Deserialize, Default)]
+struct ChromeForm {
+    #[serde(default)]
+    telescope: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kill: String,
+}
+
+async fn submit_chrome(Form(form): Form<ChromeForm>) -> Result<Response, (StatusCode, String)> {
+    let allow_kill = form.kill == "yes";
+    let (outcome, lines) = tokio::task::spawn_blocking(move || submit::ensure_chrome(submit::CDP_PORT, allow_kill))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // The launcher script's own output is the diagnosis (profile copy, Chrome's
+    // last log lines), so it goes to the server log.
+    for l in &lines {
+        println!("[chrome] {l}");
+    }
+    let tag = match outcome {
+        submit::ChromeOutcome::AlreadyUp | submit::ChromeOutcome::Launched => "launched",
+        submit::ChromeOutcome::NeedsKill => "needs_kill",
+        submit::ChromeOutcome::Failed => "failed",
+    };
+    let location = if form.telescope.is_empty() || form.name.is_empty() {
+        "/".to_string()
+    } else {
+        format!(
+            "/submit/{}/{}?chrome={}",
+            percent_encode(form.telescope.as_bytes(), NON_ALPHANUMERIC),
+            percent_encode(form.name.as_bytes(), NON_ALPHANUMERIC),
+            tag
+        )
+    };
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(header::LOCATION, location.parse::<axum::http::HeaderValue>().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?);
+    Ok((StatusCode::SEE_OTHER, headers).into_response())
+}
+
+/// Shared launch decision for both submit paths: make sure Chrome is reachable
+/// before spending minutes on an upload. Returns `Ok(())` when the uploader may
+/// run, `Err(reason)` otherwise.
+async fn ensure_browser(shared: &Arc<Mutex<submit::JobState>>) -> Result<(), String> {
+    let (outcome, lines) = tokio::task::spawn_blocking(|| submit::ensure_chrome(submit::CDP_PORT, false))
+        .await
+        .map_err(|e| format!("chrome launcher task failed: {e}"))?;
+    let last = lines.last().cloned();
+    {
+        let mut st = shared.lock().unwrap();
+        for l in lines {
+            st.lines.push(l);
+        }
+    }
+    match outcome {
+        submit::ChromeOutcome::AlreadyUp | submit::ChromeOutcome::Launched => Ok(()),
+        submit::ChromeOutcome::NeedsKill => Err(
+            "Chrome is running without the DevTools port — use 'Restart Chrome with the debug port' \
+             on the submit page (it closes that Chrome's windows)"
+                .to_string(),
+        ),
+        submit::ChromeOutcome::Failed => Err(format!(
+            "could not start Chrome: {}",
+            last.unwrap_or_else(|| "no output".to_string())
+        )),
+    }
+}
+
 pub fn spawn_submit(state: Arc<AppState>, key: String, argv: Vec<String>) {
     let shared = JobState::new("running");
     *state.submit_job.lock().unwrap() = Some((key.clone(), shared.clone()));
@@ -1774,6 +1866,15 @@ pub fn spawn_submit(state: Arc<AppState>, key: String, argv: Vec<String>) {
         use std::process::Stdio;
         use tokio::io::BufReader;
         use tokio::process::Command;
+        // A dry run talks to nobody, so it stays Chrome-free.
+        if !argv.iter().any(|a| a == "--dry-run") {
+            if let Err(reason) = ensure_browser(&shared).await {
+                let mut st = shared.lock().unwrap();
+                st.status = reason;
+                st.done = true;
+                return;
+            }
+        }
         let node = submit::node_path().unwrap_or_else(|| "node".to_string());
         let mut cmd = Command::new(node);
         cmd.args(&argv)
