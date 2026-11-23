@@ -1846,7 +1846,23 @@ pub fn spawn_submit(state: Arc<AppState>, key: String, argv: Vec<String>) {
                 let mut m = state2.submitted.lock().unwrap();
                 m.insert(key2.clone(), rec.clone());
             }
-            let _ = submit::record_submitted(&state2.cache_dir, &key2, rec);        }
+            let _ = submit::record_submitted(&state2.cache_dir, &key2, rec.clone());
+            // Mirror the draft URL into the object's plan.md. Bookkeeping only:
+            // a failed write is reported in the job log, never fatal, since the
+            // upload itself already succeeded.
+            if let Some((tel, name)) = key2.split_once('/') {
+                let dir = state2.root.join(tel).join(name);
+                let note = match submit::record_plan_link(&dir, &rec.url) {
+                    Ok(true) => Some(format!("plan.md updated: {}", dir.join("plan.md").display())),
+                    Ok(false) => None,
+                    Err(e) => Some(format!("warning: could not update plan.md in {}: {e}", dir.display())),
+                };
+                if let Some(note) = note {
+                    let mut st = shared.lock().unwrap();
+                    st.lines.push(note);
+                }
+            }
+        }
     });
 }
 

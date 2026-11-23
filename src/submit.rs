@@ -218,6 +218,16 @@ pub fn draft_url_from(line: &str) -> Option<String> {
     line.split_once("Saved draft:").map(|(_, rest)| rest.trim().to_string())
 }
 
+/// Last non-empty line of a log, used as the failure reason in error messages:
+/// the upload driver reports why it stopped on its last line.
+pub fn last_line(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_owned)
+}
+
 // --- Submitted registry ------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +276,36 @@ pub fn record_submitted(cache_dir: &Path, key: &str, rec: Submitted) -> std::io:
     map.insert(key.to_string(), rec);
     let json = serde_json::to_string_pretty(&map).map_err(std::io::Error::other)?;
     fs::write(submitted_path(cache_dir), json)
+}
+
+/// Frontmatter key the submit bridge owns in `plan.md`.
+pub const PLAN_URL_KEY: &str = "astrobin";
+
+/// Write the AstroBin draft URL into the object's `plan.md` frontmatter.
+///
+/// Only `astrobin:` is touched: a hand-kept `link:` (an older published image,
+/// a target list, whatever the owner put there) survives. Creating `plan.md`
+/// when it is missing is deliberate — an object with a submitted draft but no
+/// plan file should still show where the image went.
+///
+/// Returns `Ok(true)` when the file changed. Callers must not fail a finished
+/// upload over a bookkeeping write, so they log instead.
+pub fn record_plan_link(object_dir: &Path, url: &str) -> std::io::Result<bool> {
+    if url.is_empty() {
+        return Ok(false);
+    }
+    let path = object_dir.join("plan.md");
+    let current = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let updated = crate::plan::set_meta(&current, PLAN_URL_KEY, url);
+    if updated == current {
+        return Ok(false);
+    }
+    fs::write(&path, updated)?;
+    Ok(true)
 }
 
 /// AstroBin slug from a draft URL (`https://app.astrobin.com/i/pvc55t`).
@@ -400,6 +440,30 @@ mod tests {
         .unwrap();
         let map = load_submitted(&dir);
         assert_eq!(map.get("10RC/Bubble").unwrap().slug, "pvc55t");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plan_link_is_added_without_touching_a_user_link() {
+        let dir = std::env::temp_dir().join(format!("astro_submit_plan_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("plan.md"),
+            "---\nconstellation: Perseus\nlink: https://app.astrobin.com/i/olduser\n---\n\n## Plan\nnotes\n",
+        )
+        .unwrap();
+        let url = "https://app.astrobin.com/i/05feat";
+        assert!(record_plan_link(&dir, url).unwrap());
+        assert!(!record_plan_link(&dir, url).unwrap(), "second write should be a no-op");
+        let text = fs::read_to_string(dir.join("plan.md")).unwrap();
+        assert!(text.contains("astrobin: https://app.astrobin.com/i/05feat"));
+        assert!(text.contains("link: https://app.astrobin.com/i/olduser"));
+        assert!(text.contains("notes"));
+        // Missing plan.md gets created.
+        let bare = dir.join("nope");
+        fs::create_dir_all(&bare).unwrap();
+        assert!(record_plan_link(&bare, url).unwrap());
+        assert!(fs::read_to_string(bare.join("plan.md")).unwrap().contains(url));
         fs::remove_dir_all(&dir).ok();
     }
 }

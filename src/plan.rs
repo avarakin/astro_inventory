@@ -137,6 +137,61 @@ pub fn parse_plan(text: &str) -> (HashMap<String, String>, String) {
     (HashMap::new(), text.to_string())
 }
 
+/// Set a frontmatter key, returning the new plan text.
+///
+/// Updates the key in place when it exists (matching is case-insensitive, like
+/// `parse_plan`), appends it to the existing frontmatter block otherwise, and
+/// synthesises a `---` block at the top when the plan is plain text. The body is
+/// never touched, so a hand-written plan keeps its notes and spacing.
+///
+/// Returns the input unchanged when the key already holds `value`, letting
+/// callers skip the write.
+pub fn set_meta(text: &str, key: &str, value: &str) -> String {
+    let line = format!("{key}: {value}");
+    let opens_with_frontmatter = text.find('\n').is_some_and(|i| text[..i].trim() == "---");
+    if !opens_with_frontmatter {
+        // No frontmatter block: prepend one.
+        if text.trim().is_empty() {
+            return format!("---\n{line}\n---\n");
+        }
+        return format!("---\n{line}\n---\n{text}");
+    }
+
+    let mut out = text.to_string();
+    // Find the closing '---' and the key inside the block. Each newline marks
+    // the start of the following line, and line 1 is the opening '---'.
+    let mut close = None;
+    let mut key_start = None;
+    for (start, _) in text.match_indices('\n') {
+        let line_end = text[start + 1..].find('\n').map(|n| start + 1 + n).unwrap_or(text.len());
+        let line_text = &text[start + 1..line_end];
+        if line_text.trim() == "---" {
+            close = Some(start + 1);
+            break;
+        }
+        if line_text.contains(':') && line_text[..line_text.find(':').unwrap()].trim().eq_ignore_ascii_case(key) {
+            key_start = Some((start + 1, line_end));
+        }
+    }
+    if let Some((s, e)) = key_start {
+        if &text[s..e] == line.as_str() {
+            return out;
+        }
+        out.replace_range(s..e, &line);
+        return out;
+    }
+    match close {
+        Some(c) => out.insert_str(c, &format!("{line}\n")),
+        None => {
+            // Unterminated frontmatter: append the key at the end of the block.
+            out.push('\n');
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Does the plan text contain a TODO marker or section?
 ///
 /// Plans in the wild put this on the first line (`TODO: take RGB`) and as a
@@ -212,6 +267,16 @@ pub fn render_plan(plan_text: &str) -> String {
             ));
         }
     }
+    // `astrobin:` is written by the submit bridge, so it can sit next to a
+    // hand-kept `link:` without either being overwritten.
+    if let Some(link) = meta.get("astrobin") {
+        if !link.is_empty() {
+            top.push(format!(
+                "<a class=\"plan-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">AstroBin draft &#8599;</a>",
+                html_escape(link)
+            ));
+        }
+    }
 
     let mut parts = Vec::new();
     if !top.is_empty() {
@@ -277,6 +342,40 @@ mod tests {
         ] {
             assert!(has_todo_section(text), "missed TODO in {text:?}");
         }
+    }
+
+    #[test]
+    fn set_meta_updates_in_place_and_keeps_the_body() {
+        let plan = "---\nconstellation: Perseus\nlink: https://app.astrobin.com/i/aaaaa\n---\n\n# NGC_1333\n\n## Plan\nkeep the notes\n";
+        let out = super::set_meta(plan, "astrobin", "https://app.astrobin.com/i/05feat");
+        assert!(out.contains("astrobin: https://app.astrobin.com/i/05feat"));
+        assert!(out.contains("link: https://app.astrobin.com/i/aaaaa"), "user link clobbered");
+        assert!(out.contains("keep the notes"), "body changed");
+        // Idempotent: same value returns the same text.
+        assert_eq!(super::set_meta(&out, "astrobin", "https://app.astrobin.com/i/05feat"), out);
+        // Re-submit replaces the previous draft link rather than adding a copy.
+        let again = super::set_meta(&out, "astrobin", "https://app.astrobin.com/i/zzzzz");
+        assert_eq!(again.matches("astrobin:").count(), 1);
+        assert!(again.contains("i/zzzzz") && !again.contains("i/05feat"));
+    }
+
+    #[test]
+    fn set_meta_creates_a_frontmatter_block_for_plain_plans() {
+        let out = super::set_meta("TODO: take RGB\nRotation: 85\n", "astrobin", "https://app.astrobin.com/i/x");
+        assert!(out.starts_with("---\nastrobin: https://app.astrobin.com/i/x\n---\nTODO: take RGB"));
+        let empty = super::set_meta("", "astrobin", "https://app.astrobin.com/i/x");
+        assert_eq!(empty, "---\nastrobin: https://app.astrobin.com/i/x\n---\n");
+    }
+
+    #[test]
+    fn set_meta_matches_key_case_like_parse_plan() {
+        let out = super::set_meta("---\nAstroBin: https://app.astrobin.com/i/old\n---\nbody\n", "astrobin", "https://app.astrobin.com/i/new");
+        let keys = out
+            .lines()
+            .filter(|l| l.split(':').next().unwrap_or("").trim().eq_ignore_ascii_case("astrobin"))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["astrobin: https://app.astrobin.com/i/new"]);
+        assert!(!out.contains("i/old"));
     }
 
     #[test]

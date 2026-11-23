@@ -97,6 +97,8 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Write recorded AstroBin draft links into each object's plan.md
+    LinkPlans,
 }
 
 #[derive(Deserialize, Default)]
@@ -173,6 +175,7 @@ fn run_submit(
         .into_iter()
         .find(|r| r.telescope == tel && r.object == name)
         .ok_or_else(|| anyhow::anyhow!("{tel}/{name} is not in the inventory"))?;
+    let object_dir = rec.path.clone();
     let opts = submit::SubmitOptions {
         auto_description: !no_auto,
         llm,
@@ -206,16 +209,48 @@ fn run_submit(
     }
     let home = submit::home_dir();
     let node = submit::node_path().ok_or_else(|| anyhow::anyhow!("node is not on PATH"))?;
-    let out = std::process::Command::new(node)
+    let mut child = std::process::Command::new(node)
         .args(&argv)
         .env("NODE_PATH", home.join(submit::NODE_PATH_DIR))
         .stdin(std::process::Stdio::null())
-        .output()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    print!("{stdout}");
-    eprintln!("node exited: {:?}", out.status.code());
-    if !out.status.success() {
-        anyhow::bail!("upload failed (exit {:?})", out.status.code());
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    use std::io::Read;
+    // Stream both pipes so a long upload shows progress live, and keep stderr:
+    // the driver reports its failures there, and losing it hides the reason.
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = out_pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        print!("{buf}");
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = err_pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        eprint!("{buf}");
+        buf
+    });
+    let status = child.wait()?;
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+    eprintln!("node exited: {:?}", status.code());
+    if !status.success() {
+        let reason = submit::last_line(&stderr).or_else(|| submit::last_line(&stdout));
+        anyhow::bail!(
+            "upload failed (exit {:?}){}",
+            status.code(),
+            match reason {
+                Some(r) => format!(": {r}"),
+                None => String::new(),
+            }
+        );
     }
     if !dry_run {
         let url = stdout
@@ -231,7 +266,65 @@ fn run_submit(
             title: title.to_owned(),
             ts: chrono::Utc::now().to_rfc3339(),
         };
-        let _ = submit::record_submitted(cache_dir, target, rec);
+        let _ = submit::record_submitted(cache_dir, target, rec.clone());
+        // Keep the plan file pointed at the draft. Bookkeeping only: a failure
+        // here must not turn a successful upload into an error.
+        match submit::record_plan_link(&object_dir, &rec.url) {
+            Ok(true) => println!("plan.md updated: {}", object_dir.join("plan.md").display()),
+            Ok(false) => println!("plan.md already current ({})", object_dir.display()),
+            Err(e) => eprintln!("warning: could not update plan.md in {}: {e}", object_dir.display()),
+        }
+    }
+    Ok(())
+}
+
+/// Backfill: write every recorded draft URL into its object's `plan.md`.
+///
+/// Objects submitted before this existed have a registry entry and no plan link,
+/// so the listing shows no AstroBin chip for them.
+fn link_plans(root: &std::path::Path, cache_dir: &std::path::Path) -> anyhow::Result<()> {
+    let map = submit::load_submitted(cache_dir);
+    if map.is_empty() {
+        println!("nothing in {}", submit::submitted_path(cache_dir).display());
+        return Ok(());
+    }
+    let (mut wrote, mut current, mut missing) = (0usize, 0usize, 0usize);
+    for (key, rec) in &map {
+        let Some((tel, name)) = key.split_once('/') else {
+            println!("  {key}: malformed key, skipped");
+            missing += 1;
+            continue;
+        };
+        let dir = root.join(tel).join(name);
+        if !dir.is_dir() {
+            println!("  {key}: no such object directory {}", dir.display());
+            missing += 1;
+            continue;
+        }
+        match submit::record_plan_link(&dir, &rec.url) {
+            Ok(true) => {
+                println!("  {key}: {} -> {}", rec.url, dir.join("plan.md").display());
+                wrote += 1;
+            }
+            Ok(false) => {
+                println!("  {key}: already linked");
+                current += 1;
+            }
+            Err(e) => {
+                println!("  {key}: {e}");
+                missing += 1;
+            }
+        }
+    }
+    println!(
+        "{} entry(ies): {} updated, {} already linked, {} problem(s)",
+        map.len(),
+        wrote,
+        current,
+        missing
+    );
+    if missing > 0 {
+        anyhow::bail!("{missing} object(s) could not be updated");
     }
     Ok(())
 }
@@ -271,6 +364,9 @@ fn main() -> anyhow::Result<()> {
             *no_acquisition,
             *dry_run,
         );
+    }
+    if matches!(cli.command, Some(Command::LinkPlans)) {
+        return link_plans(&root, &cache_dir);
     }
     let staging = cli.staging.or(cfg.staging);
     let page_size = pick(cli.page_size, cfg.page_size, 20);
