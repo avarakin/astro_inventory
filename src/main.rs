@@ -96,6 +96,9 @@ enum Command {
         /// Show what would be uploaded; no browser, no upload
         #[arg(long)]
         dry_run: bool,
+        /// Finish an interrupted draft (`upload.js --resume <slug>`)
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Write recorded AstroBin draft links into each object's plan.md
     LinkPlans,
@@ -167,6 +170,7 @@ fn run_submit(
     no_setup: bool,
     no_acquisition: bool,
     dry_run: bool,
+    resume: Option<&str>,
 ) -> anyhow::Result<()> {
     let (tel, name) = target
         .split_once('/')
@@ -182,6 +186,7 @@ fn run_submit(
         dry_run,
         no_setup,
         no_acquisition,
+        resume: resume.map(str::to_owned),
     };
     let derived = submit::default_title(&rec);
     let title = title.unwrap_or(&derived);
@@ -368,6 +373,7 @@ fn main() -> anyhow::Result<()> {
         no_setup,
         no_acquisition,
         dry_run,
+        resume,
     }) = &cli.command
     {
         return run_submit(
@@ -380,6 +386,7 @@ fn main() -> anyhow::Result<()> {
             *no_setup,
             *no_acquisition,
             *dry_run,
+            resume.as_deref(),
         );
     }
     if matches!(cli.command, Some(Command::LinkPlans)) {

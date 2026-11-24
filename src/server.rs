@@ -1725,6 +1725,7 @@ async fn submit_start(
         dry_run: form.dry_run,
         no_setup: form.no_setup,
         no_acquisition: form.no_acquisition,
+        resume: None,
     };
     let argv = submit::build_argv(&rec, &opts, &form.title);
     let key = format!("{}/{}", form.telescope, form.name);

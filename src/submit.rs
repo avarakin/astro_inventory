@@ -50,6 +50,9 @@ pub struct SubmitOptions {
     pub dry_run: bool,
     pub no_setup: bool,
     pub no_acquisition: bool,
+    /// Draft to resume, for a run that aborted inside the wizard: the skill
+    /// reuses the open tab instead of starting a new upload.
+    pub resume: Option<String>,
 }
 
 /// The master image to upload: the largest `.jpg` in `master/`.
@@ -102,6 +105,10 @@ pub fn build_argv(record: &ObjectRecord, opts: &SubmitOptions, title: &str) -> V
         argv.push(file.display().to_string());
     }
     argv.push(title.to_string());
+    if let Some(draft) = &opts.resume {
+        argv.push("--resume".to_string());
+        argv.push(draft.clone());
+    }
     if let Some(setup) = setup_by_telescope(&record.telescope) {
         if !opts.no_setup {
             argv.push("--setup".to_string());
@@ -501,6 +508,24 @@ mod tests {
         assert_eq!(default_title(&ngc), "NGC 1333");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn argv_resumes_an_open_draft() {
+        let rec = record("Esprit100", "LBN762", vec!["LBN762.jpg"]);
+        let opts = SubmitOptions {
+            auto_description: true,
+            resume: Some("6g57uf".to_owned()),
+            ..Default::default()
+        };
+        let argv = build_argv(&rec, &opts, "LBN 762");
+        let joined = argv.join(" ");
+        // The slug goes with its own flag, and the title stays where the
+        // driver expects it (argv[2]).
+        assert_eq!(argv[2], "LBN 762");
+        assert!(joined.contains("--resume 6g57uf"));
+        assert!(joined.contains("--setup Esprit"));
+        assert!(joined.contains("--auto-description"));
     }
 
     #[test]
