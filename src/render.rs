@@ -51,6 +51,9 @@ pub const CSS: &str = r#"
   .meta a:hover { text-decoration: underline; }
   table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
   th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+  /* Auto layout still squeezes wrappable columns; forbidding wraps here tells
+     the browser the filters column needs its full natural width. */
+  th.col-filters, td.col-filters { white-space: nowrap; }
   th {
     background: var(--panel-2); color: var(--text);
     position: sticky; top: 0; user-select: none; font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600;
@@ -131,6 +134,7 @@ pub const CSS: &str = r#"
   .sep { color: var(--muted); }
   a.del { color: #ff8fa3; }
   textarea.plan { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; width: 100%; box-sizing: border-box; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+  textarea.desc { width: 100%; max-width: 980px; box-sizing: border-box; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font: inherit; }
   a.cancel { text-decoration: none; color: var(--accent); }
   button.danger { background: #e05268; color: #fff; border: none; padding: 8px 18px; border-radius: 8px; cursor: pointer; font-weight: 600; }
 "#;
@@ -240,6 +244,10 @@ pub enum StatusFilter {
     /// No `.pxiproject` anywhere in the object directory. Such rows are red
     /// unless a finished image was dropped into `master/` by hand.
     NoProject,
+    /// `master/` holds a finished image, whatever the project state is.
+    ImageAvailable,
+    /// `master/` holds no finished image.
+    ImageNotAvailable,
 }
 
 impl StatusFilter {
@@ -249,6 +257,8 @@ impl StatusFilter {
         match value {
             Some("missing_master") => Self::MissingMaster,
             Some("no_project") => Self::NoProject,
+            Some("image_available") => Self::ImageAvailable,
+            Some("image_missing") => Self::ImageNotAvailable,
             _ => Self::Any,
         }
     }
@@ -259,6 +269,8 @@ impl StatusFilter {
             Self::Any => None,
             Self::MissingMaster => Some("missing_master"),
             Self::NoProject => Some("no_project"),
+            Self::ImageAvailable => Some("image_available"),
+            Self::ImageNotAvailable => Some("image_missing"),
         }
     }
 
@@ -267,6 +279,8 @@ impl StatusFilter {
             Self::Any => true,
             Self::MissingMaster => rec.has_project && !rec.has_final,
             Self::NoProject => !rec.has_project,
+            Self::ImageAvailable => rec.has_final,
+            Self::ImageNotAvailable => !rec.has_final,
         }
     }
 }
@@ -373,6 +387,8 @@ pub fn render_filter_bar(
             "Project present, master image missing",
         ),
         (StatusFilter::NoProject, "Project not present"),
+        (StatusFilter::ImageAvailable, "Image available"),
+        (StatusFilter::ImageNotAvailable, "Image not available"),
     ];
     let status_opts: Vec<String> = status_options
         .iter()
@@ -543,8 +559,10 @@ pub fn render_header_cells(
                 html_escape(col.name)
             ));
         } else {
+            let cls = if col.key == "filters" { " class=\"col-filters\"" } else { "" };
             cells.push(format!(
-                "<th>{}</th>",
+                "<th{}>{}</th>",
+                cls,
                 html_escape(col.name)
             ));
         }
@@ -719,6 +737,11 @@ pub fn render_edit_page(
 
 // --- AstroBin submission ----------------------------------------------------
 
+/// Host-only label for source links (full URL stays in the href and title).
+fn short_source(url: &str) -> String {
+    url.split('/').nth(2).unwrap_or(url).to_string()
+}
+
 /// The submission preview page. It shows the command the confirm POST runs, so
 /// what you see is what gets written (the same view as the skill's `--dry-run`),
 /// plus the engine preflight and the in-flight job status.
@@ -730,6 +753,11 @@ pub fn render_submit_preview(
     submitted: Option<&Submitted>,
     job: Option<&Job>,
     chrome_note: Option<String>,
+    description: Option<&crate::submit::ObjectDescription>,
+    description_error: Option<&str>,
+    desc_note: Option<&str>,
+    back_url: Option<&str>,
+    acquisition: Option<&crate::submit::AcquisitionInfo>,
 ) -> String {
     let master = crate::submit::master_file(rec);
     let (file_disp, size_disp) = match &master {
@@ -745,8 +773,6 @@ pub fn render_submit_preview(
         None => format!("(no AstroBin setup mapping for {} — setup will be skipped)", rec.telescope),
     };
 
-    // Acquisition summary from the inventory scan: the skill rebuilds the exact
-    // per-date rows from the same directory when it runs.
     let mut filter_rows = String::new();
     let mut total_frames = 0u64;
     let mut total_sec = 0.0f64;
@@ -761,13 +787,57 @@ pub fn render_submit_preview(
         ));
     }
 
+    // Acquisition cell: prefer the exact per-frame header scan (FITS EXPTIME,
+    // CR3 EXIF) the upload itself will import; fall back to the inventory
+    // estimate when the scan is unavailable or found nothing.
+    let acq_cells = match acquisition.filter(|a| a.has_frames()) {
+        Some(a) => {
+            let rows: Vec<String> = a
+                .rows
+                .iter()
+                .map(|r| {
+                    let flt = r
+                        .filter
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(crate::traverse::filter_label)
+                        .unwrap_or("no filter");
+                    let iso = r.iso.map(|i| format!(" · ISO {i}")).unwrap_or_default();
+                    let dur = if r.duration % 1.0 == 0.0 {
+                        format!("{:.0} s", r.duration)
+                    } else {
+                        format!("{:.1} s", r.duration)
+                    };
+                    format!(
+                        "<tr><td>{}</td><td>{}</td><td>{} × {dur}{iso}</td></tr>",
+                        html_escape(&r.date),
+                        html_escape(flt),
+                        r.number
+                    )
+                })
+                .collect();
+            format!(
+                "<b>{} frames · {}</b><br><span class=\"meta\">scanned from file headers (FITS/EXIF) — the upload imports exactly these rows</span><table><tr><th>Night</th><th>Filter</th><th>Frames</th></tr>{}</table>",
+                a.frames,
+                crate::traverse::fmt_total(Some(a.seconds)),
+                rows.join("")
+            )
+        }
+        None => format!(
+            "{} frames · {} <span class=\"meta\">(inventory estimate; the upload rebuilds exact rows at run time)</span>",
+            total_frames,
+            crate::traverse::fmt_total(Some(total_sec))
+        ),
+    };
+
     let preflight_rows = [
         (format!("Chrome CDP port {}", crate::submit::CDP_PORT), pf.cdp_open, "the DevTools port the uploader connects to".to_string()),
         (
             "Chrome process".to_string(),
             pf.chrome_running,
             if pf.chrome_running {
-                "running; without the debug port it must be closed before a CDP Chrome can start"
+                "running; the debug Chrome starts as a separate window from a copied profile"
             } else {
                 "not running; the launcher starts one with the login profile"
             }
@@ -793,7 +863,9 @@ pub fn render_submit_preview(
     .join("");
 
     // Chrome actions: launching it is a side effect the user can trigger from
-    // the page, so it gets its own buttons rather than a shell-command hint.
+    // the page, so it gets its own button rather than a shell-command hint.
+    // The debug Chrome runs on a copied profile (own --user-data-dir), so it
+    // opens as a separate window even when the user's own Chrome is running.
     let chrome_block = if pf.cdp_open {
         match chrome_note {
             Some(n) => format!("<p class=\"meta\">{n}</p>"),
@@ -804,30 +876,69 @@ pub fn render_submit_preview(
             .map(|n| format!("<p class=\"meta\"><b>{n}</b></p>"))
             .unwrap_or_default();
         let launch = format!(
-            "<form method=\"post\" action=\"/submit/chrome\" class=\"inline\"><input type=\"hidden\" name=\"telescope\" value=\"{t}\"><input type=\"hidden\" name=\"name\" value=\"{nm}\"><button type=\"submit\">Launch Chrome</button></form>",
+            "<form method=\"post\" action=\"/submit/chrome\" class=\"inline\"><input type=\"hidden\" name=\"telescope\" value=\"{t}\"><input type=\"hidden\" name=\"name\" value=\"{nm}\"><button type=\"submit\">Launch Chrome window with debug port</button></form>",
             t = html_escape(&rec.telescope),
             nm = html_escape(&rec.object)
         );
-        let restart = if pf.chrome_running {
-            format!(
-                "<form method=\"post\" action=\"/submit/chrome\" class=\"inline\"><input type=\"hidden\" name=\"telescope\" value=\"{t}\"><input type=\"hidden\" name=\"name\" value=\"{nm}\"><input type=\"hidden\" name=\"kill\" value=\"yes\"><button type=\"submit\">Restart Chrome with the debug port</button></form>",
-                t = html_escape(&rec.telescope),
-                nm = html_escape(&rec.object)
-            )
-        } else {
-            String::new()
-        };
         let hint = if pf.chrome_running {
-            "A Chrome is running without the DevTools port, so the restart button closes its \
-             windows (tabs come back on the next normal start) — that is why it is a separate button."
+            "The button opens a separate Chrome window from a copy of your login profile with \
+             the debug port enabled; your own Chrome windows stay untouched. Then confirm below."
         } else {
-            "No Chrome is running: the button starts one on the copied login profile, then you can \
-             confirm below. A dry run needs no Chrome at all."
+            "The button opens a Chrome window on the copied login profile with the debug port \
+             enabled, then you can confirm below. A dry run needs no Chrome at all."
         };
         format!(
-            "{note}<p class=\"meta\"><b>Chrome is not listening on CDP port {}.</b> {hint}</p><p>{launch}{restart}</p>",
+            "{note}<p class=\"meta\"><b>Chrome is not listening on CDP port {}.</b> {hint}</p><p>{launch}</p>",
             crate::submit::CDP_PORT
         )
+    };
+
+    // Description section: the LLM-generated text is shown here for review
+    // and edit inside the confirm form; the upload uses exactly this text.
+    let regen_action = format!(
+        "/submit/{}/{}/regenerate-description",
+        percent_encode(rec.telescope.as_bytes(), DIR_QUERY),
+        percent_encode(rec.object.as_bytes(), DIR_QUERY)
+    );
+    let regen_form = format!(
+        "<form method=\"post\" action=\"{regen_action}\" class=\"inline\"><button type=\"submit\" class=\"plain\">Regenerate</button></form>"
+    );
+    let desc_section = match (description, description_error) {
+        (Some(d), _) => {
+            let path = d.path.clone().unwrap_or_else(|| "?".to_string());
+            let sources = d
+                .sources
+                .iter()
+                .map(|u| format!("<a href=\"{}\" target=\"_blank\" rel=\"noreferrer\">{}</a>", html_escape(u), html_escape(&short_source(u))))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            format!(
+                "<p class=\"meta\">Generated by the retrieval + LLM pipeline (path: <b>{path}</b>). Review and edit freely — Confirm uploads exactly this text. {regen_form}</p>\n<details class=\"meta\"><summary>Sources ({n})</summary><p>{sources}</p></details>",
+                n = d.sources.len()
+            )
+        }
+        (None, Some(e)) => format!(
+            "<p class=\"meta\"><b>Could not generate a description:</b> {e} {regen_form} Leave the box empty and the upload engine will fetch its own.</p>",
+            e = html_escape(e)
+        ),
+        (None, None) => format!(
+            "<p class=\"meta\">No description generated yet. {regen_form} Leave the box empty and the upload engine will fetch its own.</p>"
+        ),
+    };
+    let desc_note = desc_note
+        .map(|n| format!("<p class=\"meta\"><b>{n}</b></p>"))
+        .unwrap_or_default();
+    let desc_text = description
+        .and_then(|d| d.text.clone())
+        .unwrap_or_default();
+    // With a known referrer, link straight back to it (filters intact); with
+    // only our own redirect chain behind us, fall back to the inventory.
+    // Never history.back(): the 303 self-redirects (chrome, description,
+    // regenerate) leave same-page history entries, so the first back lands on
+    // another copy of this page and looks dead.
+    let back_link = match back_url {
+        Some(u) => format!("<a href=\"{}\" class=\"cancel\">← Back</a>", html_escape(u)),
+        None => "<a href=\"/\" class=\"cancel\">← Back</a>".to_string(),
     };
 
     let cmd = format!(
@@ -884,7 +995,7 @@ pub fn render_submit_preview(
 </head>
 <body>
 {navbar}
-<h1>AstroBin submission: {tel}/{name}</h1>
+<h1>AstroBin submission: {tel}/{name} {back_link}</h1>
 <p class="meta">AstroBin's API is read-only, so this drives the web uploader
 through a logged-in Chrome. The draft is left unpublished; the Publish button is
 never pressed. One submission runs at a time.</p>
@@ -894,13 +1005,15 @@ never pressed. One submission runs at a time.</p>
 <tr><th>File</th><td>{file} ({size})</td></tr>
 <tr><th>Title</th><td>{title_disp}</td></tr>
 <tr><th>AstroBin setup</th><td>{setup_disp}</td></tr>
-<tr><th>Acquisition</th><td>{frames} frames · {total} (rows built per date at upload time)</td></tr>
+<tr><th>Acquisition</th><td>{acq_cells}</td></tr>
 </table>
 <h2>Filters in inventory</h2>
 <table><tr><th>Filter</th><th>Frames</th><th>Duration</th></tr>{filter_rows}</table>
 <h2>Engine preflight</h2>
 <table><tr><th>Component</th><th>State</th><th>Why</th></tr>{preflight_rows}</table>
 {chrome_block}
+<h2>Description</h2>
+{desc_note}{desc_section}
 <h2>Command the confirm button runs</h2>
 <pre class="plan">{cmd}</pre>
 <h2>Confirm</h2>
@@ -909,6 +1022,9 @@ never pressed. One submission runs at a time.</p>
   <input type="hidden" name="name" value="{name_esc}">
   <label for="title">Title:</label>
   <input type="text" id="title" name="title" value="{title_esc}">
+  <p><label for="description">Description (uploaded exactly as shown):</label></p>
+  <textarea id="description" name="description" rows="12" class="desc">{desc_esc}</textarea>
+  <p class="meta">The checkboxes below apply only while the description box is empty.</p>
   <p>
     <label><input type="checkbox" name="auto_description" value="true" checked> auto description (Brave/Wikipedia)</label>
     <label><input type="checkbox" name="llm" value="true" checked> LLM phrasing (fact-guarded)</label>
@@ -958,11 +1074,14 @@ setInterval(poll, 2000);
         size = size_disp,
         title_disp = html_escape(title),
         setup_disp = html_escape(&setup_disp),
-        frames = total_frames,
-        total = crate::traverse::fmt_total(Some(total_sec)),
+        acq_cells = acq_cells,
         filter_rows = filter_rows,
         preflight_rows = preflight_rows,
         chrome_block = chrome_block,
+        desc_section = desc_section,
+        desc_note = desc_note,
+        back_link = back_link,
+        desc_esc = html_escape(&desc_text),
         cmd = cmd,
         tel_esc = html_escape(&rec.telescope),
         name_esc = html_escape(&rec.object),
@@ -2627,5 +2746,69 @@ mod tests {
             html.contains("$(\"img\").style.outline = m ? \"3px solid #FFD700\" : \"none\";"),
             "marked files must get a yellow ring around the filter border"
         );
+    }
+}
+
+#[cfg(test)]
+mod back_link_tests {
+    use super::*;
+    use crate::submit::Preflight;
+
+    fn pf() -> Preflight {
+        Preflight {
+            node: true,
+            puppeteer: true,
+            script: true,
+            cdp_open: true,
+            chrome_running: false,
+            pi: true,
+            brave_key: true,
+        }
+    }
+
+    fn rec() -> ObjectRecord {
+        use crate::traverse::FilterStats;
+        use std::collections::BTreeMap;
+        let mut filters = BTreeMap::new();
+        filters.insert("L".to_string(), FilterStats { count: 1, seconds: 300.0, durations: BTreeMap::new() });
+        ObjectRecord {
+            telescope: "10RC".into(),
+            object: "M42".into(),
+            path: std::path::PathBuf::from("/data/Astro/CCD/10RC/M42"),
+            filters,
+            cr2cr3_count: 0,
+            latest: None,
+            has_project: false,
+            has_final: true,
+            size_bytes: 0,
+            final_images: Vec::new(),
+            plan: None,
+            has_todo: false,
+            plan_mtime: None,
+            transit: None,
+            transit_sort: 0.0,
+        }
+    }
+
+    fn render(back_url: Option<&str>) -> String {
+        let rec = rec();
+        render_submit_preview(&rec, "M42", &[], &pf(), None, None, None, None, None, None, back_url, None)
+    }
+
+    /// Back must be a single plain navigation. history.back() was wrong: the
+    /// 303 self-redirects (chrome, description, regenerate) stack same-page
+    /// history entries, so the first click landed on another submit page.
+    #[test]
+    fn back_without_referer_links_to_inventory_and_never_uses_history() {
+        let html = render(None);
+        assert!(html.contains("<a href=\"/\" class=\"cancel\">← Back</a>"));
+        assert!(!html.contains("history.back"));
+    }
+
+    #[test]
+    fn back_with_referer_preserves_the_inventory_view() {
+        let html = render(Some("/?status=missing"));
+        assert!(html.contains("href=\"/?status=missing\""));
+        assert!(!html.contains("history.back"));
     }
 }

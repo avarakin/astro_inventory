@@ -53,6 +53,10 @@ pub struct SubmitOptions {
     /// Draft to resume, for a run that aborted inside the wizard: the skill
     /// reuses the open tab instead of starting a new upload.
     pub resume: Option<String>,
+    /// Curated description text (already reviewed/edited on the submit page).
+    /// When set, the driver uploads it verbatim via `--description-file` and
+    /// skips web retrieval and the LLM entirely.
+    pub description_file: Option<PathBuf>,
 }
 
 /// The master image to upload: the largest `.jpg` in `master/`.
@@ -96,6 +100,180 @@ pub fn default_title(record: &ObjectRecord) -> String {
     }
 }
 
+/// Ahead-of-time object description shown (and editable) on the submit page.
+/// Mirrors the `DESCRIBE_JSON` line the driver's `--describe-only` mode prints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectDescription {
+    pub ok: bool,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<String>,
+}
+
+/// Generate the object description without touching Chrome: runs the driver
+/// with `--describe-only`, which does the web retrieval, the fact-guarded LLM
+/// pass, and prints one `DESCRIBE_JSON {…}` line. Blocks (tens of seconds for
+/// retrieval + inference); async callers must use `spawn_blocking`.
+pub fn describe_object(record: &ObjectRecord) -> anyhow::Result<ObjectDescription> {
+    let node = node_path().ok_or_else(|| anyhow::anyhow!("node is not on PATH"))?;
+    let script = home_dir().join(SKILL_SCRIPT);
+    if !script.is_file() {
+        anyhow::bail!("skill script missing: {}", script.display());
+    }
+    let mut args: Vec<String> = vec![script.display().to_string()];
+    if let Some(file) = master_file(record) {
+        args.push(file.display().to_string());
+    }
+    args.push(default_title(record));
+    args.push("--object-dir".to_string());
+    args.push(record.path.display().to_string());
+    args.push("--auto-description".to_string());
+    args.push("--llm-description".to_string());
+    args.push("--describe-only".to_string());
+    let mut child = std::process::Command::new(&node)
+        .args(&args)
+        .env("NODE_PATH", home_dir().join(NODE_PATH_DIR))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("cannot run {}: {e}", script.display()))?;
+    // Retrieval timeouts inside the driver stay well under this ceiling; the
+    // guard is only against a wedged node process holding the page open.
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("describe timed out after 300 s");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => {
+                let _ = child.wait();
+                anyhow::bail!("wait failed: {e}");
+            }
+        }
+    }
+    let out = child.wait_with_output().map_err(|e| anyhow::anyhow!("capture failed: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("DESCRIBE_JSON "))
+        .ok_or_else(|| {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let tail = err.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
+            anyhow::anyhow!("driver printed no DESCRIBE_JSON line; stderr: {tail}")
+        })?;
+    let desc: ObjectDescription =
+        serde_json::from_str(line).map_err(|e| anyhow::anyhow!("bad DESCRIBE_JSON: {e}"))?;
+    if !desc.ok || desc.text.as_deref().unwrap_or("").trim().is_empty() {
+        anyhow::bail!(
+            "description generation found nothing (path: {})",
+            desc.path.as_deref().unwrap_or("?")
+        );
+    }
+    Ok(desc)
+}
+
+/// One acquisition session row, mirroring a row of the driver's `ACQ_JSON`
+/// payload (`upload.js --acquisition-json`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcquisitionRow {
+    pub date: String,
+    pub number: u64,
+    pub duration: f64,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub iso: Option<i64>,
+}
+
+/// Scanned acquisition data for one object. The driver computes it from file
+/// headers — FITS `EXPTIME` for deep-sky rigs, EXIF `ExposureTime` for DSLR
+/// (CR3) objects — which is exact, unlike the inventory scan that counts DSLR
+/// frames but assumes 30 s subs to stay fast.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcquisitionInfo {
+    pub frames: u64,
+    pub seconds: f64,
+    pub rows: Vec<AcquisitionRow>,
+}
+
+impl AcquisitionInfo {
+    /// True when the scan actually found light frames.
+    pub fn has_frames(&self) -> bool {
+        self.frames > 0
+    }
+}
+
+/// Scan the object's acquisition data by running the driver in
+/// `--acquisition-json` mode: it reads the same headers the upload will
+/// import, including per-frame EXIF for DSLR frames. Reading thousands of
+/// EXIF headers takes seconds, so this only ever runs on a blocking thread,
+/// on page load; the caller caches the result per object.
+pub fn scan_acquisition(record: &ObjectRecord) -> anyhow::Result<AcquisitionInfo> {
+    let node = node_path().ok_or_else(|| anyhow::anyhow!("node is not on PATH"))?;
+    let script = home_dir().join(SKILL_SCRIPT);
+    if !script.is_file() {
+        anyhow::bail!("skill script missing: {}", script.display());
+    }
+    let args: Vec<String> = vec![
+        script.display().to_string(),
+        "--object-dir".to_string(),
+        record.path.display().to_string(),
+        "--acquisition-json".to_string(),
+    ];
+    let mut child = std::process::Command::new(&node)
+        .args(&args)
+        .env("NODE_PATH", home_dir().join(NODE_PATH_DIR))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("cannot run {}: {e}", script.display()))?;
+    // EXIF/FITS header reads are milliseconds per batch; the ceiling only
+    // guards against a wedged node holding the page open.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("acquisition scan timed out after 120 s");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                let _ = child.wait();
+                anyhow::bail!("wait failed: {e}");
+            }
+        }
+    }
+    let out = child.wait_with_output().map_err(|e| anyhow::anyhow!("capture failed: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_acq_json(&stdout).ok_or_else(|| {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let tail = err.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
+        anyhow::anyhow!("driver printed no ACQ_JSON line; stderr: {tail}")
+    })
+}
+
+/// Parse the driver's `ACQ_JSON` line out of its stdout (the driver prints
+/// progress logs around it).
+pub fn parse_acq_json(stdout: &str) -> Option<AcquisitionInfo> {
+    let line = stdout.lines().rev().find_map(|l| l.trim().strip_prefix("ACQ_JSON "))?;
+    serde_json::from_str(line).ok()
+}
+
 /// Full `node …/upload.js …` argv, excluding the interpreter.
 pub fn build_argv(record: &ObjectRecord, opts: &SubmitOptions, title: &str) -> Vec<String> {
     let mut argv = Vec::new();
@@ -117,11 +295,21 @@ pub fn build_argv(record: &ObjectRecord, opts: &SubmitOptions, title: &str) -> V
     }
     argv.push("--object-dir".to_string());
     argv.push(record.path.display().to_string());
-    if opts.auto_description {
-        argv.push("--auto-description".to_string());
-    }
-    if opts.llm {
-        argv.push("--llm-description".to_string());
+    match &opts.description_file {
+        // The page supplied a reviewed description: it wins, and the driver
+        // must not fetch or generate anything.
+        Some(p) => {
+            argv.push("--description-file".to_string());
+            argv.push(p.display().to_string());
+        }
+        None => {
+            if opts.auto_description {
+                argv.push("--auto-description".to_string());
+            }
+            if opts.llm {
+                argv.push("--llm-description".to_string());
+            }
+        }
     }
     if opts.no_setup {
         argv.push("--no-setup".to_string());
@@ -205,9 +393,6 @@ pub const CHROME_SCRIPT: &str = ".agents/skills/astrobin-upload/scripts/start-ch
 pub enum ChromeOutcome {
     AlreadyUp,
     Launched,
-    /// Chrome is running without the debug port, so the launcher would have to
-    /// close the user's windows. That is a human decision, not a default.
-    NeedsKill,
     Failed,
 }
 
@@ -224,11 +409,15 @@ pub fn chrome_running() -> bool {
 
 /// Make sure a CDP-enabled Chrome is listening, starting one when needed.
 ///
+/// The debug Chrome runs on a copied profile, so it opens as a separate window
+/// and coexists with the user's own Chrome; only a stale previous debug
+/// instance blocks the launch (the script reports that and suggests --kill).
+///
 /// Blocks while the script runs: first use copies the browser profile (about a
 /// minute), after that Chrome answers the port in a few seconds. Callers on an
 /// async runtime must wrap this in `spawn_blocking`. Returns the script's own
 /// log lines so the reason for a failure reaches the page.
-pub fn ensure_chrome(port: u16, allow_kill: bool) -> (ChromeOutcome, Vec<String>) {
+pub fn ensure_chrome(port: u16) -> (ChromeOutcome, Vec<String>) {
     if cdp_open(port) {
         return (
             ChromeOutcome::AlreadyUp,
@@ -240,15 +429,6 @@ pub fn ensure_chrome(port: u16, allow_kill: bool) -> (ChromeOutcome, Vec<String>
         return (
             ChromeOutcome::Failed,
             vec![format!("launcher script missing: {}", script.display())],
-        );
-    }
-    if chrome_running() && !allow_kill {
-        return (
-            ChromeOutcome::NeedsKill,
-            vec![
-                "Chrome is already running without the DevTools port; a second instance cannot \
-                 share the profile, so starting one means closing the running windows".to_string(),
-            ],
         );
     }
     let log = std::env::temp_dir().join("astro_inventory_chrome_launch.log");
@@ -265,9 +445,6 @@ pub fn ensure_chrome(port: u16, allow_kill: bool) -> (ChromeOutcome, Vec<String>
         .stdin(std::process::Stdio::null())
         .stdout(out_file)
         .stderr(err_file);
-    if allow_kill {
-        cmd.arg("--kill");
-    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -529,6 +706,21 @@ mod tests {
     }
 
     #[test]
+    fn argv_uses_description_file_instead_of_fetch_flags() {
+        let rec = record("10RC", "Bubble", vec!["Bubble10RC.jpg"]);
+        let opts = SubmitOptions {
+            auto_description: true,
+            llm: true,
+            description_file: Some(PathBuf::from("/tmp/desc.txt")),
+            ..Default::default()
+        };
+        let joined = build_argv(&rec, &opts, "Bubble Nebula").join(" ");
+        assert!(joined.contains("--description-file /tmp/desc.txt"));
+        assert!(!joined.contains("--auto-description"));
+        assert!(!joined.contains("--llm-description"));
+    }
+
+    #[test]
     fn argv_carries_setup_object_dir_and_flags() {
         let rec = record("10RC", "Bubble", vec!["Bubble10RC.jpg"]);
         let opts = SubmitOptions {
@@ -603,7 +795,7 @@ mod tests {
         // the launcher must probe first and never start a second browser.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let (outcome, lines) = ensure_chrome(port, false);
+        let (outcome, lines) = ensure_chrome(port);
         assert_eq!(outcome, ChromeOutcome::AlreadyUp);
         assert!(lines.iter().any(|l| l.contains("already listening")));
     }
@@ -630,5 +822,26 @@ mod tests {
         assert!(record_plan_link(&bare, url).unwrap());
         assert!(fs::read_to_string(bare.join("plan.md")).unwrap().contains(url));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parses_acq_json_line() {
+        let stdout = "Inventory: 135mm/Orion\nAcquisition: 2 row(s)\nACQ_JSON {\"frames\":66,\"seconds\":7986,\"rows\":[{\"date\":\"2026-11-09\",\"number\":25,\"duration\":121,\"filter\":null,\"iso\":6400},{\"date\":\"2026-11-10\",\"number\":41,\"duration\":121.4,\"filter\":null,\"iso\":6400}]}\n";
+        let a = parse_acq_json(stdout).expect("parses");
+        assert_eq!(a.frames, 66);
+        assert_eq!(a.rows.len(), 2);
+        assert!((a.rows[1].duration - 121.4).abs() < 1e-9);
+        assert_eq!(a.rows[0].iso, Some(6400));
+        assert!(a.has_frames());
+    }
+
+    #[test]
+    fn acq_json_filters_null_filter_and_missing_line() {
+        // FITS rows carry filter letters; missing iso is null.
+        let stdout = "ACQ_JSON {\"frames\":36,\"seconds\":10800,\"rows\":[{\"date\":\"2025-12-18\",\"number\":36,\"duration\":300,\"filter\":\"H\",\"iso\":null}]}";
+        let a = parse_acq_json(stdout).expect("parses");
+        assert_eq!(a.rows[0].filter.as_deref(), Some("H"));
+        assert_eq!(a.rows[0].iso, None);
+        assert_eq!(parse_acq_json("no machine line here"), None);
     }
 }

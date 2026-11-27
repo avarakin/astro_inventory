@@ -555,10 +555,10 @@ pub fn build_row(
     // a double-submit visible.
     let submit_url = submit_url_fn(&rec.telescope, &rec.object);
     let submit_html = if rec.final_images.is_empty() {
-        "<button class=\"btn btn-edit\" disabled title=\"no master JPEG in master/\">AstroBin</button>".to_string()
+        "<button class=\"btn btn-edit\" disabled title=\"no master JPEG in master/\">Submit to Astrobin</button>".to_string()
     } else {
         format!(
-            "<button class=\"btn btn-edit\" onclick=\"location.href='{}'\">AstroBin</button>",
+            "<button class=\"btn btn-edit\" onclick=\"location.href='{}'\">Submit to Astrobin</button>",
             html_escape(&submit_url)
         )
     };
@@ -610,7 +610,7 @@ pub fn build_row(
          <td data-sort=\"{transit_sort}\">{}</td>\
          <td data-sort=\"{total_sec}\">{}</td>\
          <td data-sort=\"{size_mb:.6}\">{size_mb:.1}</td>\
-         <td data-sort=\"\">{filters_html}</td>\
+         <td data-sort=\"\" class=\"col-filters\">{filters_html}</td>\
          <td data-sort=\"\">{thumbs_html}</td>\
          <td data-sort=\"\">{plan_html}</td>\
          <td data-sort=\"\">{actions_html}</td>\

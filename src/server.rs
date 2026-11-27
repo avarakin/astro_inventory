@@ -69,6 +69,14 @@ pub struct AppState {
     /// Objects already submitted, keyed `telescope/object` -> draft. Loaded
     /// from the cache dir at startup, appended when a job prints its draft URL.
     pub submitted: Mutex<BTreeMap<String, Submitted>>,
+    /// Generated object descriptions shown (and editable) on the submit page,
+    /// keyed `telescope/object`. Generated once per object per server run, or
+    /// on demand via the Regenerate button.
+    pub descriptions: Mutex<BTreeMap<String, submit::ObjectDescription>>,
+    /// Scanned acquisition data (FITS EXPTIME / CR3 EXIF per frame), read
+    /// lazily on submit-page load and cached: the scan is too slow for the
+    /// inventory walk but exact for the upload.
+    pub acquisitions: Mutex<BTreeMap<String, submit::AcquisitionInfo>>,
 }
 
 struct ScanCache {
@@ -116,6 +124,8 @@ impl AppState {
             cache_dir: cache_dir.clone(),
             submit_job: Mutex::new(None),
             submitted: Mutex::new(submit::load_submitted(&cache_dir)),
+            descriptions: Mutex::new(BTreeMap::new()),
+            acquisitions: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -307,6 +317,8 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/submit", post(submit_start))
         .route("/submit/chrome", post(submit_chrome))
         .route("/submit/progress", get(submit_progress))
+        .route("/submit/{telescope}/{name}/regenerate-description", post(submit_description_regenerate))
+        .layer(axum::middleware::from_fn(no_store_html))
         .with_state(state)
 }
 
@@ -326,7 +338,8 @@ struct IndexQuery {
     /// Filter: only directories belonging to this telescope (a telescope
     /// directory name, same values as the "Add a new object" dropdown).
     telescope: Option<String>,
-    /// Filter: project/master state — `missing_master` or `no_project`.
+    /// Filter: project/master state — see `StatusFilter::parse` for the
+    /// accepted values.
     status: Option<String>,
     /// Legacy status parameter from before the dropdown had two values;
     /// `missing_master=1` still means "Project present, master image missing".
@@ -1615,6 +1628,10 @@ struct SubmitForm {
     telescope: String,
     name: String,
     title: String,
+    /// Reviewed (possibly edited) description from the page textarea. When
+    /// present it is uploaded verbatim; the fetch/LLM flags are ignored.
+    #[serde(default)]
+    description: String,
     #[serde(default)]
     auto_description: bool,
     #[serde(default)]
@@ -1649,10 +1666,28 @@ fn find_record(
 /// confirm POST runs, so the page is the dry-run view.
 async fn submit_preview_page(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Path((tel, name)): Path<(String, String)>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Html<String>, (StatusCode, String)> {
     let rec = find_record(&state, &tel, &name)?;
+    // Where "← Back" should land: the referring page (filters, sort and page
+    // intact). After our own 303 bounces the referer is another submit page,
+    // which restores nothing — pass None and let the browser history decide.
+    let back_url = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| {
+            let after = match r.find("://") {
+                Some(i) => &r[i + 3..],
+                None => r,
+            };
+            let path = match after.find('/') {
+                Some(i) => &after[i..],
+                None => "/",
+            };
+            (!path.starts_with("/submit/")).then(|| path.to_string())
+        });
     let title = submit::default_title(&rec);
     let opts = SubmitOptions {
         auto_description: true,
@@ -1670,7 +1705,36 @@ async fn submit_preview_page(
         .unwrap()
         .get(&key)
         .cloned();
+    // Exact acquisition data comes from the same header scan the upload will
+    // import from (incl. per-frame CR3 EXIF). That scan is deliberately kept
+    // out of the inventory walk, so run it once here, on first page load.
+    let cached_acq = state.acquisitions.lock().unwrap().get(&key).cloned();
+    let acquisition = match cached_acq {
+        Some(a) => Some(a),
+        None => {
+            let rec2 = rec.clone();
+            let scanned = tokio::task::spawn_blocking(move || submit::scan_acquisition(&rec2))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .filter(|a| a.has_frames());
+            if scanned.is_none() {
+                println!("[submit] {key}: acquisition scan found nothing (driver error or no light frames)");
+            }
+            if let Some(a) = scanned.clone() {
+                state.acquisitions.lock().unwrap().insert(key.clone(), a);
+            }
+            scanned
+        }
+    };
     let job = state.submit_job.lock().unwrap().clone();
+    // The description is generated ahead of time (web retrieval + LLM, tens of
+    // seconds on first visit) and cached per object, so the textarea on the
+    // page is prefilled and editable instead of the upload happening blind.
+    let (description, description_error) = match object_description(&state, &rec, &key, false).await {
+        Ok(d) => (Some(d), None),
+        Err(e) => (None, Some(e)),
+    };
     // The launch button posts elsewhere and redirects back here, so the outcome
     // travels as a query tag: the page then shows the current preflight.
     let chrome_note = match params.get("chrome").map(|s| s.as_str()) {
@@ -1682,10 +1746,11 @@ async fn submit_preview_page(
             "Chrome launch failed — the CDP port {} is still closed. Check the launcher log.",
             submit::CDP_PORT
         )),
-        Some("needs_kill") => Some(
-            "Chrome is running without the debug port; use Restart Chrome with the debug port."
-                .to_string(),
-        ),
+        _ => None,
+    };
+    let desc_note: Option<&str> = match params.get("desc").map(|s| s.as_str()) {
+        Some("ok") => Some("Description regenerated."),
+        Some("failed") => Some("Description regeneration failed — see the note below."),
         _ => None,
     };
     Ok(Html(crate::render::render_submit_preview(
@@ -1696,7 +1761,64 @@ async fn submit_preview_page(
         submitted.as_ref(),
         job.as_ref(),
         chrome_note,
+        description.as_ref(),
+        description_error.as_deref(),
+        desc_note,
+        back_url.as_deref(),
+        acquisition.as_ref(),
     )))
+}
+
+/// Cached-or-generate one object description. `force` ignores the cache (the
+/// page's Regenerate button). Retrieval + inference take tens of seconds, so
+/// this runs on the blocking pool, like the cold review render.
+async fn object_description(
+    state: &Arc<AppState>,
+    rec: &crate::traverse::ObjectRecord,
+    key: &str,
+    force: bool,
+) -> Result<submit::ObjectDescription, String> {
+    if !force {
+        if let Some(d) = state.descriptions.lock().unwrap().get(key) {
+            return Ok(d.clone());
+        }
+    }
+    let rec2 = rec.clone();
+    let d = tokio::task::spawn_blocking(move || submit::describe_object(&rec2))
+        .await
+        .map_err(|e| format!("describe task failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+    state
+        .descriptions
+        .lock()
+        .unwrap()
+        .insert(key.to_string(), d.clone());
+    Ok(d)
+}
+
+/// Regenerate the cached description for one object, then bounce back to the
+/// preview page (which shows the textarea again, now refilled).
+async fn submit_description_regenerate(
+    State(state): State<Arc<AppState>>,
+    Path((tel, name)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, String)> {
+    let rec = find_record(&state, &tel, &name)?;
+    let key = format!("{tel}/{name}");
+    state.descriptions.lock().unwrap().remove(&key);
+    let tag = match object_description(&state, &rec, &key, true).await {
+        Ok(_) => "ok",
+        Err(e) => {
+            println!("[describe] {key} regenerate failed: {e}");
+            "failed"
+        }
+    };
+    let back = format!(
+        "/submit/{}/{}?desc={}",
+        percent_encode(tel.as_bytes(), crate::render::DIR_QUERY),
+        percent_encode(name.as_bytes(), crate::render::DIR_QUERY),
+        tag
+    );
+    Ok(axum::response::Redirect::to(&back).into_response())
 }
 
 /// Confirm: build the argv, check the engine, spawn the skill as one serialized
@@ -1719,6 +1841,25 @@ async fn submit_start(
             format!("master file does not exist: {}", master.display()),
         ));
     }
+    // A non-empty textarea means the user reviewed (and maybe edited) the
+    // generated description: upload it verbatim from a temp file instead of
+    // letting the driver fetch its own.
+    let description_file = if form.description.trim().is_empty() {
+        None
+    } else {
+        let dir = state.cache_dir.join("descriptions");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot write {}: {e}", dir.display())))?;
+        let sanitize = |s: &str| -> String {
+            s.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+                .collect()
+        };
+        let path = dir.join(format!("{}_{}.txt", sanitize(&form.telescope), sanitize(&form.name)));
+        std::fs::write(&path, form.description.trim())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot write {}: {e}", path.display())))?;
+        Some(path)
+    };
     let opts = SubmitOptions {
         auto_description: form.auto_description,
         llm: form.llm,
@@ -1726,6 +1867,7 @@ async fn submit_start(
         no_setup: form.no_setup,
         no_acquisition: form.no_acquisition,
         resume: None,
+        description_file,
     };
     let argv = submit::build_argv(&rec, &opts, &form.title);
     let key = format!("{}/{}", form.telescope, form.name);
@@ -1788,21 +1930,18 @@ async fn submit_start(
 /// Spawns `node …/upload.js …` and streams milestones into the shared job slot.
 /// Start a CDP-enabled Chrome on demand. The uploader needs a logged-in Chrome
 /// with the DevTools port; rather than telling the user to open a terminal, the
-/// preview page posts here. `kill=yes` is the deliberate variant that closes a
-/// Chrome running without the port — never the default.
+/// preview page posts here. The debug Chrome runs on a copied profile, so it
+/// opens as a separate window and leaves the user's Chrome untouched.
 #[derive(Deserialize, Default)]
 struct ChromeForm {
     #[serde(default)]
     telescope: String,
     #[serde(default)]
     name: String,
-    #[serde(default)]
-    kill: String,
 }
 
 async fn submit_chrome(Form(form): Form<ChromeForm>) -> Result<Response, (StatusCode, String)> {
-    let allow_kill = form.kill == "yes";
-    let (outcome, lines) = tokio::task::spawn_blocking(move || submit::ensure_chrome(submit::CDP_PORT, allow_kill))
+    let (outcome, lines) = tokio::task::spawn_blocking(move || submit::ensure_chrome(submit::CDP_PORT))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     // The launcher script's own output is the diagnosis (profile copy, Chrome's
@@ -1812,7 +1951,6 @@ async fn submit_chrome(Form(form): Form<ChromeForm>) -> Result<Response, (Status
     }
     let tag = match outcome {
         submit::ChromeOutcome::AlreadyUp | submit::ChromeOutcome::Launched => "launched",
-        submit::ChromeOutcome::NeedsKill => "needs_kill",
         submit::ChromeOutcome::Failed => "failed",
     };
     let location = if form.telescope.is_empty() || form.name.is_empty() {
@@ -1834,7 +1972,7 @@ async fn submit_chrome(Form(form): Form<ChromeForm>) -> Result<Response, (Status
 /// before spending minutes on an upload. Returns `Ok(())` when the uploader may
 /// run, `Err(reason)` otherwise.
 async fn ensure_browser(shared: &Arc<Mutex<submit::JobState>>) -> Result<(), String> {
-    let (outcome, lines) = tokio::task::spawn_blocking(|| submit::ensure_chrome(submit::CDP_PORT, false))
+    let (outcome, lines) = tokio::task::spawn_blocking(|| submit::ensure_chrome(submit::CDP_PORT))
         .await
         .map_err(|e| format!("chrome launcher task failed: {e}"))?;
     let last = lines.last().cloned();
@@ -1846,11 +1984,6 @@ async fn ensure_browser(shared: &Arc<Mutex<submit::JobState>>) -> Result<(), Str
     }
     match outcome {
         submit::ChromeOutcome::AlreadyUp | submit::ChromeOutcome::Launched => Ok(()),
-        submit::ChromeOutcome::NeedsKill => Err(
-            "Chrome is running without the DevTools port — use 'Restart Chrome with the debug port' \
-             on the submit page (it closes that Chrome's windows)"
-                .to_string(),
-        ),
         submit::ChromeOutcome::Failed => Err(format!(
             "could not start Chrome: {}",
             last.unwrap_or_else(|| "no output".to_string())
@@ -1892,20 +2025,30 @@ pub fn spawn_submit(state: Arc<AppState>, key: String, argv: Vec<String>) {
                 return;
             }
         };
-        // Milestones go to stdout, warnings to stderr; both are drained so the
-        // pipes never block the child.
+        // Tee the run to ~/.cache/astro_inventory/logs so the trace survives a
+        // service restart; milestones go to stdout, warnings to stderr, both
+        // drained so the pipes never block the child.
+        let log_dir = state2.cache_dir.join("logs");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let stamp = Local::now().format("%Y%m%d-%H%M%S");
+        let log_path = log_dir.join(format!("submit-{}-{stamp}.log", key2.replace('/', "_")));
+        let log_out = std::fs::File::create(&log_path).ok();
+        if log_out.is_some() {
+            println!("[submit] {key2}: logging run to {}", log_path.display());
+        }
+        let log_err = log_out.as_ref().and_then(|f| f.try_clone().ok());
         let out = child.stdout.take();
         let err = child.stderr.take();
         let s1 = shared.clone();
         let s2 = shared.clone();
         let t1 = tokio::spawn(async move {
             if let Some(o) = out {
-                drain_lines(BufReader::new(o), s1).await;
+                drain_lines(BufReader::new(o), s1, log_out).await;
             }
         });
         let t2 = tokio::spawn(async move {
             if let Some(e) = err {
-                drain_lines(BufReader::new(e), s2).await;
+                drain_lines(BufReader::new(e), s2, log_err).await;
             }
         });
         let status = child.wait().await;
@@ -1968,10 +2111,31 @@ pub fn spawn_submit(state: Arc<AppState>, key: String, argv: Vec<String>) {
     });
 }
 
-async fn drain_lines<R>(mut reader: tokio::io::BufReader<R>, shared: Arc<Mutex<JobState>>)
-where
+/// HTML pages always reflect current state (submitted badges, counts):
+/// `no-store` also keeps the browser from reviving a back/forward cache
+/// snapshot of the inventory over a live navigation.
+async fn no_store_html(req: Request, next: axum::middleware::Next) -> Response {
+    let mut res = next.run(req).await;
+    if res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/html"))
+    {
+        res.headers_mut()
+            .insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    }
+    res
+}
+
+async fn drain_lines<R>(
+    mut reader: tokio::io::BufReader<R>,
+    shared: Arc<Mutex<JobState>>,
+    mut log: Option<std::fs::File>,
+) where
     R: tokio::io::AsyncRead + Unpin + Send,
 {
+    use std::io::Write as _;
     use tokio::io::AsyncBufReadExt;
     loop {
         let mut line = String::new();
@@ -1981,6 +2145,12 @@ where
                 let t = line.trim().to_string();
                 if t.is_empty() {
                     continue;
+                }
+                // The in-memory job dies with a server restart; the log file
+                // survives, so a crash investigated later still has its trace.
+                if let Some(f) = log.as_mut() {
+                    let _ = writeln!(f, "{t}");
+                    let _ = f.flush();
                 }
                 let mut st = shared.lock().unwrap();
                 // Keep every line, capped: the failure reason (`ERROR: …`,

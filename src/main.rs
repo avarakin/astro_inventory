@@ -187,6 +187,8 @@ fn run_submit(
         no_setup,
         no_acquisition,
         resume: resume.map(str::to_owned),
+        // The CLI has no reviewed-description input; the driver fetches its own.
+        description_file: None,
     };
     let derived = submit::default_title(&rec);
     let title = title.unwrap_or(&derived);
@@ -207,20 +209,14 @@ fn run_submit(
     }
     if !dry_run {
         // Same auto-launch the web path does, so the CLI works after a reboot
-        // without a separate Chrome ritual. Killing a Chrome that is already
-        // open stays a human decision: the script's --kill is not used here.
-        let (outcome, lines) = submit::ensure_chrome(submit::CDP_PORT, false);
+        // without a separate Chrome ritual: the debug Chrome runs on a copied
+        // profile and coexists with any Chrome the user has open.
+        let (outcome, lines) = submit::ensure_chrome(submit::CDP_PORT);
         for l in &lines {
             println!("[chrome] {l}");
         }
         match outcome {
             submit::ChromeOutcome::AlreadyUp | submit::ChromeOutcome::Launched => {}
-            submit::ChromeOutcome::NeedsKill => {
-                anyhow::bail!(
-                    "Chrome is running without the DevTools port; close it (or run \
-                     ~/.agents/skills/astrobin-upload/scripts/start-chrome.sh --kill) and retry"
-                );
-            }
             submit::ChromeOutcome::Failed => {
                 anyhow::bail!(
                     "could not start Chrome: {}",
