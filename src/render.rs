@@ -2342,11 +2342,13 @@ mod tests {
         let edit = render_edit_page("scope", "M31", "/p", "plan", "");
         let staging = render_review_index(&[std::path::PathBuf::from("/nowhere")], &[]);
         let review = render_review("/nowhere", 500, None, None, false);
+        let reconcile = page_reconcile(&[]);
         for (name, html) in [
             ("index", &index),
             ("edit", &edit),
             ("staging", &staging),
             ("review", &review),
+            ("reconcile", &reconcile),
         ] {
             assert!(html.contains("<nav class=\"topnav\">"), "{name} missing navbar");
             assert!(html.contains("Staging</a>") || html.contains("Staging</span>"),
@@ -2746,6 +2748,160 @@ mod tests {
             html.contains("$(\"img\").style.outline = m ? \"3px solid #FFD700\" : \"none\";"),
             "marked files must get a yellow ring around the filter border"
         );
+    }
+}
+
+/// One submitted object on the visual-reconciliation grid (`/reconcile`).
+pub struct ReconcileEntry {
+    /// Registry key, `telescope/object`.
+    pub key: String,
+    /// Ready-made `/edit/<tel>/<name>` href (segments pre-encoded).
+    pub edit_href: String,
+    pub slug: String,
+    pub title: String,
+    /// ISO-ish publish/submit date for the caption (already trimmed).
+    pub date: String,
+    /// Server path that streams the local master JPEG.
+    pub master_src: String,
+    /// Server path that streams the downloaded AstroBin snapshot.
+    pub ab_src: String,
+    pub has_master: bool,
+    pub has_ab: bool,
+}
+
+/// Visual reconciliation grid: local master next to the AstroBin snapshot
+/// for every registered image, so matches can be audited at a glance.
+pub fn page_reconcile(entries: &[ReconcileEntry]) -> String {
+    let cards: String = entries
+        .iter()
+        .map(|e| {
+            let master = if e.has_master {
+                format!(
+                    "<a href=\"{}\" target=\"_blank\" rel=\"noopener\"><img loading=\"lazy\" src=\"{}\" alt=\"local master\"></a>",
+                    html_escape(&e.master_src), html_escape(&e.master_src)
+                )
+            } else {
+                "<div class=\"missing\">no local master</div>".to_string()
+            };
+            let ab = if e.has_ab {
+                format!(
+                    "<a href=\"{}\" target=\"_blank\" rel=\"noopener\"><img loading=\"lazy\" src=\"{}\" alt=\"astrobin snapshot\"></a>",
+                    html_escape(&e.ab_src), html_escape(&e.ab_src)
+                )
+            } else {
+                "<div class=\"missing\">no snapshot</div>".to_string()
+            };
+            format!(
+                concat!(
+                    "<div class=\"card\" data-text=\"{}\">\n",
+                    "<div class=\"head\"><a href=\"{}\">{}</a><span class=\"date\">{}</span></div>\n",
+                    "<div class=\"pair\"><div class=\"pane\">{}</div><div class=\"pane\">{}</div></div>\n",
+                    "<div class=\"cap\"><a href=\"https://app.astrobin.com/i/{}\" target=\"_blank\" rel=\"noopener\">{}</a> &middot; {}</div>\n",
+                    "</div>"
+                ),
+                html_escape(&format!("{} {} {}", e.key, e.title, e.slug)),
+                html_escape(&e.edit_href),
+                html_escape(&e.key),
+                html_escape(&e.date),
+                master,
+                ab,
+                html_escape(&e.slug),
+                html_escape(&e.slug),
+                html_escape(&e.title),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let navbar = render_navbar("reconcile");
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reconcile — AstroBin vs local masters</title>
+<style>
+{CSS}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 14px; }}
+.card {{ background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }}
+.card .head {{ display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }}
+.card .head a {{ color: var(--accent); text-decoration: none; font-weight: 600; }}
+.card .date {{ color: var(--muted); font-size: 12px; }}
+.pair {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }}
+.pane {{ background: #000; border-radius: 6px; overflow: hidden; min-height: 120px;
+        display: flex; align-items: center; justify-content: center; }}
+.pane img {{ width: 100%; height: 210px; object-fit: contain; display: block; cursor: zoom-in; }}
+.missing {{ color: var(--muted); font-size: 12px; padding: 2em .5em; text-align: center; }}
+.cap {{ color: var(--muted); font-size: 12px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.cap a {{ color: var(--accent-2); text-decoration: none; }}
+#filter {{ width: 100%; max-width: 30em; padding: .5em .8em; margin: 0 0 1em;
+          background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; }}
+</style>
+</head>
+<body>
+{navbar}
+<h1>Visual reconcile</h1>
+<p class="meta">{count} registered images — local master (left) vs AstroBin snapshot (right). Click an image for full size.</p>
+<input id="filter" type="search" placeholder="filter by object, title, or slug…" autocomplete="off">
+<div class="grid">
+{cards}
+</div>
+<script>
+"use strict";
+(function () {{
+  const input = document.getElementById("filter");
+  const cards = Array.from(document.querySelectorAll(".card"));
+  input.addEventListener("input", () => {{
+    const q = input.value.trim().toLowerCase();
+    for (const c of cards) c.style.display = !q || c.dataset.text.toLowerCase().includes(q) ? "" : "none";
+  }});
+}})();
+</script>
+</body>
+</html>"#,
+        count = entries.len(),
+    )
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+
+    fn entry(key: &str, has_master: bool, has_ab: bool) -> ReconcileEntry {
+        ReconcileEntry {
+            key: key.into(),
+            edit_href: format!("/edit/{key}"),
+            slug: "abc123".into(),
+            title: "Test & <nebula>".into(),
+            date: "2026-01-02".into(),
+            master_src: format!("/masterimg/{key}"),
+            ab_src: "/abthumb/abc123".into(),
+            has_master,
+            has_ab,
+        }
+    }
+
+    #[test]
+    fn reconcile_pairs_local_and_astrobin_images() {
+        let html = page_reconcile(&[entry("8RC/M42", true, true)]);
+        assert!(html.contains("src=\"/masterimg/8RC/M42\""), "missing master img");
+        assert!(html.contains("src=\"/abthumb/abc123\""), "missing snapshot img");
+        assert!(html.contains("loading=\"lazy\""));
+        assert!(html.contains("cur\">Reconcile<"), "navbar marks section");
+    }
+
+    #[test]
+    fn reconcile_shows_placeholders_for_missing_files() {
+        let html = page_reconcile(&[entry("8RC/M42", false, false)]);
+        assert!(html.contains("no local master"));
+        assert!(html.contains("no snapshot"));
+        assert!(!html.contains("<img"), "placeholders must not render img tags");
+    }
+
+    #[test]
+    fn reconcile_escapes_titles() {
+        let html = page_reconcile(&[entry("8RC/M42", true, true)]);
+        assert!(html.contains("Test &amp; &lt;nebula&gt;"));
     }
 }
 

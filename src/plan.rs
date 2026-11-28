@@ -233,7 +233,7 @@ pub fn linkify(escaped_text: &str) -> String {
 
 fn plan_link_label(url: &str) -> &'static str {
     if url.to_lowercase().contains("astrobin") {
-        "AstroBin"
+        "Sample"
     } else {
         "Link"
     }
@@ -272,7 +272,7 @@ pub fn render_plan(plan_text: &str) -> String {
     if let Some(link) = meta.get("astrobin") {
         if !link.is_empty() {
             top.push(format!(
-                "<a class=\"plan-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">AstroBin draft &#8599;</a>",
+                "<a class=\"plan-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">AstroBin &#8599;</a>",
                 html_escape(link)
             ));
         }

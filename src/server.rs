@@ -18,7 +18,7 @@ use crate::plan::expand_constellation;
 use crate::render::{
     col_by_key, filter_query_suffix, page_size_control, record_matches_filters, render_edit_page,
     render_filter_bar, render_header_cells, render_index_page, render_pager, render_review,
-    render_review_index, sort_records, StatusFilter,
+    render_review_index, sort_records, page_reconcile, ReconcileEntry, StatusFilter,
 };
 use crate::traverse::{build_row, traverse, ObjectRecord};
 use crate::review::{self, Manifest, PreviewCache, PreviewState};
@@ -304,6 +304,9 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/compendium/data", get(compendium_data))
         .route("/compendium/thumb/{id}", get(compendium_thumb))
         .route("/staging", get(staging_index))
+        .route("/reconcile", get(reconcile_page))
+        .route("/abthumb/{slug}", get(abthumb))
+        .route("/masterimg/{telescope}/{name}", get(masterimg))
         .route("/review", get(review))
         .route("/review/manifest", get(review_manifest))
         .route("/review/preview", get(review_preview))
@@ -2187,8 +2190,127 @@ async fn submit_progress(State(state): State<Arc<AppState>>) -> Json<serde_json:
     }
 }
 
+/// Unreserved characters kept when encoding one URL path segment (telescope
+/// or object names may contain spaces that would otherwise split the URL).
+const PATH_SEGMENT_SAFE: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+fn enc_seg(s: &str) -> String {
+    percent_encode(s.as_bytes(), PATH_SEGMENT_SAFE).to_string()
+}
+
+/// True for AstroBin image slugs: 4-12 lowercase alphanumeric characters.
+/// A hard whitelist — the slug is joined into a cache path, so separators
+/// must never appear.
+fn valid_ab_slug(s: &str) -> bool {
+    (4..=12).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// `/reconcile` — every registered image as a card pairing the local master
+/// with the offline AstroBin snapshot, for visual match auditing.
+async fn reconcile_page(State(state): State<Arc<AppState>>) -> Html<String> {
+    let snap_dir = state.cache_dir.join("abthumbs");
+    let submitted = state.submitted.lock().unwrap().clone();
+    let mut entries: Vec<ReconcileEntry> = submitted
+        .iter()
+        .map(|(key, rec)| {
+            let (tel, name) = key.split_once('/').unwrap_or((key.as_str(), ""));
+            let date = {
+                let t = rec.ts.trim();
+                if t.len() >= 10 && t.as_bytes()[4] == b'-' {
+                    t[..10].to_string()
+                } else {
+                    t.chars().take(10).collect()
+                }
+            };
+            let has_master = !rec.file.is_empty() && std::path::Path::new(&rec.file).is_file();
+            let has_ab = valid_ab_slug(&rec.slug) && snap_dir.join(format!("{}.jpg", rec.slug)).is_file();
+            ReconcileEntry {
+                key: key.clone(),
+                edit_href: format!("/edit/{}/{}", enc_seg(tel), enc_seg(name)),
+                slug: rec.slug.clone(),
+                title: rec.title.clone(),
+                date,
+                master_src: format!("/masterimg/{}/{}", enc_seg(tel), enc_seg(name)),
+                ab_src: format!("/abthumb/{}", rec.slug),
+                has_master,
+                has_ab,
+            }
+        })
+        .collect();
+    // Newest first: dates are ISO strings for anything the bridge recorded.
+    entries.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| a.key.cmp(&b.key)));
+    Html(page_reconcile(&entries))
+}
+
+/// Serves an offline AstroBin snapshot (`<cache>/abthumbs/<slug>.jpg`).
+async fn abthumb(State(state): State<Arc<AppState>>, Path(slug): Path<String>) -> Response {
+    if !valid_ab_slug(&slug) {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    }
+    let path = state.cache_dir.join("abthumbs").join(format!("{slug}.jpg"));
+    match tokio::task::spawn_blocking(move || std::fs::read(&path)).await {
+        Ok(Ok(bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/jpeg")
+            .header(header::CACHE_CONTROL, "public, max-age=86400")
+            .body(Body::from(bytes))
+            .unwrap(),
+        _ => (StatusCode::NOT_FOUND, "Not found").into_response(),
+    }
+}
+
+/// Serves the local master JPEG recorded for `telescope/object`. The file
+/// path comes from the registry, never from the request.
+async fn masterimg(
+    State(state): State<Arc<AppState>>,
+    Path((tel, name)): Path<(String, String)>,
+) -> Response {
+    let key = format!("{tel}/{name}");
+    let file = state
+        .submitted
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|r| r.file.clone())
+        .filter(|f| !f.is_empty());
+    let Some(file) = file else {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    };
+    let ct = if file.to_lowercase().ends_with(".png") {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
+    match tokio::task::spawn_blocking(move || std::fs::read(&file)).await {
+        Ok(Ok(bytes)) => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, ct)
+                .header(header::CACHE_CONTROL, "public, max-age=3600")
+                .body(Body::from(bytes))
+                .unwrap()
+        }
+        _ => (StatusCode::NOT_FOUND, "Not found").into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ab_slug_validation_rejects_paths_and_junk() {
+        assert!(valid_ab_slug("wx0trj"));
+        assert!(valid_ab_slug("abc123"));
+        assert!(!valid_ab_slug(""));
+        assert!(!valid_ab_slug("abc"));
+        assert!(!valid_ab_slug("../../etc/passwd"));
+        assert!(!valid_ab_slug("slug/../x"));
+        assert!(!valid_ab_slug("Slug1")); // uppercase is not an AstroBin slug
+        assert!(!valid_ab_slug("slug.jpg"));
+    }
     use super::*;
 
     /// The filter query tolerates the form's empty "Any" values and refuses

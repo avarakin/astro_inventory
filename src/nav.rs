@@ -11,10 +11,11 @@ pub fn render_navbar(active: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"topnav\">{} &middot; {} &middot; {}</nav>",
+        "<nav class=\"topnav\">{} &middot; {} &middot; {} &middot; {}</nav>",
         item("inventory", "/", "Inventory"),
         item("staging", "/staging", "Staging"),
         item("compendium", "/compendium", "Compendium"),
+        item("reconcile", "/reconcile", "Reconcile"),
     )
 
 }
